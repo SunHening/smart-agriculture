@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leaflet × 天地图影像示例</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css"
+    integrity="sha256-kLaT2GOSpHechhsozzB+flnD+zUyjE2LlfWPgU04xyI=" crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"
+    integrity="sha256-WBkoXOwTeyKclOHuWtc+i2uENFpDZ9YPdf5Hf+D7ewM=" crossorigin=""></script>
+  <style>
+    body {
+      font-family: "Manrope", "Noto Sans SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #0f172a, #020617 70%);
+      min-height: 100vh;
+    }
+
+    .leaflet-control-container .leaflet-control {
+      border-radius: 16px;
+      overflow: hidden;
+    }
+
+    .leaflet-popup-content-wrapper {
+      border-radius: 16px;
+    }
+  </style>
+</head>
+
+<body class="text-slate-100">
+  <main class="max-w-6xl mx-auto px-6 py-10 space-y-8">
+    <section class="space-y-3 text-center">
+      <p
+        class="inline-flex items-center gap-2 text-sm font-semibold tracking-wide uppercase text-sky-300 bg-white/10 px-4 py-1 rounded-full">
+        Leaflet × 天地图</p>
+      <h1 class="text-4xl md:text-5xl font-bold text-white">影像底图 + 中文注记示例</h1>
+      <p class="text-lg text-slate-300 max-w-3xl mx-auto">示例展示如何在 Leaflet 中加载天地图 WMTS 影像底图与影像注记图层，并提供底图切换、地标定位等交互。</p>
+    </section>
+
+    <div class="grid md:grid-cols-[2fr_1fr] gap-6">
+      <div class="bg-white/5 backdrop-blur rounded-3xl shadow-2xl ring-1 ring-white/10 overflow-hidden">
+        <div id="tdt-map" class="h-full  w-full"></div>
+      </div>
+
+      <aside class="bg-white/5 backdrop-blur rounded-3xl p-6 space-y-5 ring-1 ring-white/10">
+        <h2 class="text-2xl font-semibold text-white">控制面板</h2>
+        <div class="space-y-5 text-sm text-slate-200">
+          <div class="space-y-3">
+            <div>
+              <span class="font-semibold text-sky-200">底图切换</span>
+              <p class="text-xs text-slate-400">影像/矢量底图搭配注记层。</p>
+            </div>
+            <div class="grid grid-cols-2 gap-3" id="basemap-switch">
+              <button data-type="img"
+                class="rounded-2xl border border-sky-400 bg-white/10 px-4 py-3 text-left transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400">
+                <p class="font-semibold text-white text-base">影像底图</p>
+                <p class="text-xs text-slate-300">遥感影像 + 注记</p>
+              </button>
+              <button data-type="vec"
+                class="rounded-2xl border border-transparent bg-white/5 px-4 py-3 text-left transition hover:border-sky-400 hover:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400">
+                <p class="font-semibold text-white text-base">矢量底图</p>
+                <p class="text-xs text-slate-300">道路 + 中文注记</p>
+              </button>
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="font-semibold text-sky-200">快速定位</span>
+              <span class="text-xs text-slate-400">示例地标</span>
+            </div>
+            <div class="bg-white/10 rounded-2xl px-4 py-3 space-y-2">
+              <label for="location-select" class="text-xs uppercase tracking-wide text-slate-400">选择地点</label>
+              <select id="location-select"
+                class="w-full rounded-xl border border-white/10 bg-slate-900/40 px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none">
+                <option value="shilou" selected>山西 · 石楼县火车站</option>
+                <option value="yonghe">山西 · 永和</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <h3 class="font-semibold text-sky-200 mb-1">交互提示</h3>
+            <ul class="list-disc list-inside space-y-1">
+              <li>滚轮缩放、拖拽漫游</li>
+              <li>Leaflet 控件可重置 / 显示比例尺</li>
+              <li>点击标记查看弹窗</li>
+            </ul>
+          </div>
+
+          <div>
+            <h3 class="font-semibold text-sky-200 mb-1">地图点击</h3>
+            <p id="click-info" class="text-sm text-slate-300 bg-white/10 rounded-2xl px-4 py-3">
+              点击地图任意位置以查看经纬度并落下临时标记。
+            </p>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const tk = 'b2d9cc5faa19adaf7b5c80c90e61e5d7';
+      const subdomains = ['0', '1', '2', '3', '4', '5', '6', '7'];
+      const createLayer = (layer) =>
+        L.tileLayer(`https://t{s}.tianditu.gov.cn/${layer}_w/wmts?service=wmts&request=getTile&version=1.0.0&layer=${layer}&style=default&tilematrixset=w&format=tiles&tilematrix={z}&tilerow={y}&tilecol={x}&tk=${tk}`, {
+          subdomains,
+          maxZoom: 18,
+          minZoom: 3,
+          tileSize: 256
+        });
+
+      const baseLayers = {
+        img: createLayer('img'),
+        vec: createLayer('vec')
+      };
+      const labelLayers = {
+        img: createLayer('cia'),
+        vec: createLayer('cva')
+      };
+
+      const defaultCenter = [36.96311, 110.80496];
+      const map = L.map('tdt-map', {
+        center: defaultCenter,
+        zoom: 17,
+        zoomControl: false,
+        attributionControl: false
+      });
+
+
+
+      let currentBase = null;
+      let currentLabel = null;
+
+      const switchBasemap = (type) => {
+        if (currentBase) map.removeLayer(currentBase);
+        if (currentLabel) map.removeLayer(currentLabel);
+        currentBase = baseLayers[type];
+        currentLabel = labelLayers[type];
+        currentBase.addTo(map);
+        currentLabel.addTo(map);
+        updateBasemapButtons(type);
+      };
+
+      const updateBasemapButtons = (type) => {
+        const buttons = document.querySelectorAll('#basemap-switch button');
+        buttons.forEach(btn => {
+          const active = btn.dataset.type === type;
+          btn.classList.toggle('border-sky-400', active);
+          btn.classList.toggle('bg-white/10', active);
+          btn.classList.toggle('border-transparent', !active);
+          btn.classList.toggle('bg-white/5', !active);
+        });
+      };
+
+      switchBasemap('img');
+
+      L.control.zoom({ position: 'topleft' }).addTo(map);
+      L.control.scale({ position: 'bottomleft', imperial: false }).addTo(map);
+      L.control.attribution({ prefix: 'Leaflet · 天地图' }).addTo(map);
+
+      const focusPoints = {
+        shilou: { coord: [36.96311, 110.80496], zoom: 12, label: '山西石楼县' },
+        yonghe: { coord: [36.70461, 110.71903], zoom: 13, label: '山西永和县' },
+      };
+
+      const marker = L.marker(defaultCenter, { riseOnHover: true }).addTo(map);
+      marker.bindPopup('<strong>山西石楼县火车站</strong><br/>默认定位，可按需替换坐标。').openPopup();
+
+      const clickInfo = document.getElementById('click-info');
+      let clickMarker = null;
+      map.on('click', (event) => {
+        const { lat, lng } = event.latlng;
+        if (!clickMarker) {
+          clickMarker = L.circleMarker(event.latlng, {
+            radius: 8,
+            color: '#38bdf8',
+            weight: 3,
+            opacity: 0.9,
+            fillColor: '#38bdf8',
+            fillOpacity: 0.4
+          }).addTo(map);
+        } else {
+          clickMarker.setLatLng(event.latlng);
+        }
+        clickInfo.textContent = `最近一次点击：纬度 ${lat.toFixed(5)}，经度 ${lng.toFixed(5)}`;
+      });
+
+      document.getElementById('basemap-switch').addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-type]');
+        if (!button) return;
+        switchBasemap(button.dataset.type);
+      });
+
+      document.getElementById('location-select').addEventListener('change', (event) => {
+        const key = event.target.value;
+        const target = focusPoints[key];
+        if (!target) return;
+        map.setView(target.coord, target.zoom);
+        marker.setLatLng(target.coord);
+        marker.setPopupContent(`<strong>${target.label}</strong><br/>示例中心点，可按需替换坐标。`);
+        marker.openPopup();
+      });
+    });
+  </script>
+</body>
+
+</html>

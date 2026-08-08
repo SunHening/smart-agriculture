@@ -1,0 +1,76 @@
+/* 全局样式覆盖 - 企业级后台风格 */
+
+/* 卡片统一圆角和阴影 */
+.el-card {
+  border-radius: 10px !important;
+  border: none !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+}
+.el-card__header {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1a1a1a;
+  border-bottom: 1px solid #f5f5f5 !important;
+}
+
+/* 表格优化 */
+.el-table {
+  --el-table-border-color: #f5f5f5;
+  --el-table-header-bg-color: #fafafa;
+}
+.el-table th.el-table__cell {
+  font-weight: 600;
+  font-size: 13px;
+  color: #666;
+}
+.el-table td.el-table__cell {
+  font-size: 13px;
+}
+
+/* 按钮圆角 */
+.el-button {
+  border-radius: 6px;
+}
+
+/* 对话框圆角 */
+.el-dialog {
+  border-radius: 12px !important;
+}
+.el-dialog__header {
+  border-bottom: 1px solid #f5f5f5;
+  padding-bottom: 16px !important;
+}
+.el-dialog__title {
+  font-weight: 600;
+}
+
+/* 分页器 */
+.el-pagination {
+  --el-pagination-button-bg-color: transparent;
+}
+
+/* 输入框 */
+.el-input__wrapper {
+  border-radius: 6px;
+}
+
+/* 标签 */
+.el-tag {
+  border-radius: 4px;
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: #ddd;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #bbb;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
