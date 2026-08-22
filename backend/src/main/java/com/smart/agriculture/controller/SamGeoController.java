@@ -117,6 +117,90 @@ public class SamGeoController {
         }
     }
 
+    /**
+     * 地图截图检测（前端传 base64 图片，绕过天地图服务端下载限制）
+     */
+    @PostMapping("/detect-image")
+    public Result<?> detectImage(@RequestBody Map<String, Object> params) {
+        try {
+            Long userId = Long.valueOf(params.get("userId").toString());
+            Long fieldId = params.get("fieldId") != null ? Long.valueOf(params.get("fieldId").toString()) : null;
+            String imageType = params.get("imageType") != null ? params.get("imageType").toString() : "REMOTE_SENSING";
+            String filename = params.get("originalFilename") != null
+                    ? params.get("originalFilename").toString()
+                    : "image_" + System.currentTimeMillis() + ".png";
+
+            // Step 1: 创建 ImageTask
+            ImageTask task = new ImageTask();
+            task.setUserId(userId);
+            task.setFieldId(fieldId);
+            task.setImageType(imageType);
+            task.setOriginalFilename(filename);
+            task.setGsd(params.get("gsd") != null ? new BigDecimal(params.get("gsd").toString()) : null);
+            task.setStatus("PROCESSING");
+            task.setCreateTime(LocalDateTime.now());
+            task.setUpdateTime(LocalDateTime.now());
+            imageTaskService.save(task);
+
+            // Step 2: 转发到 Python /detect-image
+            Map<String, Object> pythonReq = new HashMap<>();
+            pythonReq.put("image_base64", params.get("imageBase64"));
+            pythonReq.put("gsd", params.getOrDefault("gsd", 1.2));
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(pythonReq, headers);
+
+            ResponseEntity<Map> response = restTemplate.postForEntity(
+                    samGeoServiceUrl + "/detect-image", request, Map.class);
+
+            Map<String, Object> pyResult = response.getBody();
+            if (pyResult == null || !Boolean.TRUE.equals(pyResult.get("success"))) {
+                task.setStatus("FAILED");
+                task.setErrorMsg(pyResult != null ? (String) pyResult.get("error") : "Python 服务异常");
+                imageTaskService.updateById(task);
+                return Result.error("检测失败: " + task.getErrorMsg());
+            }
+
+            // Step 3: 保存检测结果
+            List<Map<String, Object>> boundaries = (List<Map<String, Object>>) pyResult.get("boundaries");
+            double totalArea = ((Number) pyResult.get("total_area_mu")).doubleValue();
+
+            for (Map<String, Object> b : boundaries) {
+                DetectionResult dr = new DetectionResult();
+                dr.setImageTaskId(task.getId());
+                dr.setFieldId(fieldId);
+                dr.setBoundaryGeoJson(new ObjectMapper().writeValueAsString(b.get("geojson")));
+                dr.setDetectedArea(BigDecimal.valueOf(((Number) b.get("area_mu")).doubleValue()));
+                dr.setConfidence(BigDecimal.valueOf(((Number) b.get("confidence")).doubleValue()));
+                dr.setModelName("SAM-Geo");
+                dr.setModelVersion("v1.0.0");
+                dr.setProcessingTimeMs(((Number) pyResult.get("processing_time_ms")).longValue());
+                dr.setStatus("SUCCESS");
+                dr.setCreateTime(LocalDateTime.now());
+                detectionResultService.save(dr);
+            }
+
+            // Step 4: 更新 ImageTask
+            task.setStatus("COMPLETED");
+            task.setUpdateTime(LocalDateTime.now());
+            imageTaskService.updateById(task);
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("imageTaskId", task.getId());
+            result.put("boundaries", boundaries);
+            result.put("totalAreaMu", totalArea);
+            result.put("fieldCount", pyResult.get("field_count"));
+            result.put("processingTimeMs", pyResult.get("processing_time_ms"));
+            result.put("overlayBase64", pyResult.get("overlay_base64"));
+
+            return Result.success(result);
+
+        } catch (Exception e) {
+            return Result.error("检测异常: " + e.getMessage());
+        }
+    }
+
     /** 健康检查 */
     @GetMapping("/health")
     public Result<?> health() {

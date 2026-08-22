@@ -1,198 +1,177 @@
 """
 SAM-Geo 推理引擎
-使用 Segment Anything Model (SAM) 从遥感影像中分割农田区域
+使用 Segment Anything Model (SAM) 从遥感/航拍影像中分割农田区域
+
+依赖安装:
+    pip install segment-geospatial opencv-python pillow numpy
+首次运行将自动下载 SAM 预训练权重（vit_b 约 375MB）。
 """
 import logging
+import os
+import tempfile
+import glob
+import threading
+
 import numpy as np
-from PIL import Image, ImageDraw
 import cv2
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# SAM 权重缓存目录
+SAM_CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sam_geo")
+
+# 各模型默认权重文件名
+CHECKPOINT_NAMES = {
+    "vit_b": "sam_vit_b_01ec64.pth",
+    "vit_l": "sam_vit_l_0b3195.pth",
+    "vit_h": "sam_vit_h_4b8939.pth",
+}
+
 
 class SamGeoInference:
-    """
-    SAM-Geo 推理封装
-    支持自动分割（全图网格提示点）和手动提示点分割
+    """SAM-Geo 推理封装（纯 SAM，不再回退 ExG）"""
 
-    依赖安装:
-        pip install segment-geospatial opencv-python pillow numpy
-        # 或使用完整 requirements.txt
-    """
-
-    def __init__(self, model_type="vit_h", checkpoint_path=None, device="cpu"):
+    def __init__(self, model_type="vit_b", checkpoint_path=None, device="cpu"):
         """
         model_type: vit_h / vit_l / vit_b
-        checkpoint_path: SAM 权重文件路径, None 则自动下载
+        checkpoint_path: SAM 权重文件路径，None 则自动下载/查找缓存
         device: "cpu" / "cuda"
         """
         self.model_type = model_type
         self.checkpoint_path = checkpoint_path
         self.device = device
         self.model = None
+        self._load_attempted = False
+        # SAM 模型（SamAutomaticMaskGenerator/SamPredictor）非线程安全，
+        # 并发请求会互相覆盖 predictor 状态导致 "An image must be set" 错误，故加锁串行化。
+        self._lock = threading.Lock()
+
+    def _resolve_checkpoint(self):
+        """查找本地已下载的权重，找不到返回 None（交由 samgeo 自动下载）"""
+        if self.checkpoint_path and os.path.exists(self.checkpoint_path):
+            return self.checkpoint_path
+
+        name = CHECKPOINT_NAMES.get(self.model_type, f"sam_{self.model_type}.pth")
+        patterns = [
+            os.path.join(SAM_CHECKPOINT_DIR, name),
+            os.path.join(SAM_CHECKPOINT_DIR, "sam_*.pth"),
+            # segment-geospatial 默认下载到 torch hub 缓存目录
+            os.path.join(os.path.expanduser("~"), ".cache", "torch", "hub", "checkpoints", name),
+            os.path.join(os.getcwd(), "sam_*.pth"),
+        ]
+        for pat in patterns:
+            matches = glob.glob(pat)
+            if matches:
+                return matches[0]
+        return None
 
     def _load_model(self):
-        """延迟加载 SAM 模型"""
-        if self.model is not None:
+        """延迟加载 SAM 模型（权重缺失时自动下载）"""
+        if self._load_attempted:
             return
+        self._load_attempted = True
 
-        try:
-            from segment_geospatial import SamGeo
-            logger.info(f"加载 SAM 模型: {self.model_type}, device={self.device}")
+        from samgeo import SamGeo
 
-            self.model = SamGeo(
-                model_type=self.model_type,
-                checkpoint=self.checkpoint_path,
-                sam_kwargs=None
-            )
-            logger.info("SAM 模型加载成功")
+        kwargs = {}
+        ckpt = self._resolve_checkpoint()
+        if ckpt:
+            kwargs["checkpoint"] = ckpt
+            logger.info(f"加载 SAM 模型: {self.model_type}, checkpoint={ckpt}")
+        else:
+            logger.info(f"加载 SAM 模型: {self.model_type}（首次运行将自动下载权重，约 375MB）")
 
-        except ImportError:
-            logger.warning("segment-geospatial 未安装，使用 OpenCV 传统分割作为后备")
-            self.model = "opencv_fallback"
+        # device 是 SamGeo 的独立参数，不能放进 sam_kwargs：
+        # sam_kwargs 会被转发给 SamAutomaticMaskGenerator，后者不接受 device 参数。
+        # points_per_side 默认 32（1024 个采样点），CPU 推理慢；农田为大块连续区域，
+        # 降到 16（256 点）约提速 4 倍，对分割效果影响很小。
+        self.model = SamGeo(
+            model_type=self.model_type,
+            device=self.device,
+            sam_kwargs={"points_per_side": 16},
+            **kwargs
+        )
+        logger.info("SAM 模型加载成功")
 
     def segment(self, image, prompts=None):
         """
         分割图像中的农田区域
 
         Args:
-            image: PIL.Image — 遥感影像
-            prompts: 提示点列表 [{"type":"point","data":[x,y],"label":1}]
-                     None 表示自动网格提示
+            image: PIL.Image
+            prompts: 提示点列表（可选）
 
         Returns:
             boundaries: [{"geojson": {...}, "pixel_area": float, "confidence": float}, ...]
             overlay: PIL.Image — 原图 + 掩码叠加
         """
-        self._load_model()
+        with self._lock:
+            return self._segment(image, prompts)
 
+    def _segment(self, image, prompts=None):
+        self._load_model()
         img_np = np.array(image)
 
-        if self.model == "opencv_fallback":
-            return self._fallback_segment(img_np)
-
+        tmp_path = None
+        mask_path = None
         try:
-            # SAM-Geo 推理
-            # 将图像保存为临时文件（segment-geospatial 需要文件路径）
-            import tempfile
-            import os
-            from segment_geospatial import SamGeo
-
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
                 image.save(f.name)
                 tmp_path = f.name
+            mask_path = tmp_path.replace(".png", "_mask.tif")
 
-            try:
-                # 使用 SAM 生成掩码
-                if isinstance(self.model, SamGeo):
-                    self.model.generate(tmp_path, tmp_path.replace(".png", "_mask.tif"))
-                    # 读取生成的掩码
-                    mask = cv2.imread(tmp_path.replace(".png", "_mask.tif"), cv2.IMREAD_GRAYSCALE)
-                    if mask is not None:
-                        boundaries = self._mask_to_boundaries(mask)
-                        overlay = self._create_overlay(img_np, mask)
-                        os.unlink(tmp_path.replace(".png", "_mask.tif"))
-                        return boundaries, overlay
-            finally:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
+            self.model.generate(tmp_path, mask_path)
 
-            return [], image
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None or np.sum(mask) == 0:
+                logger.warning("SAM 未检测到任何区域")
+                return [], image
 
-        except Exception as e:
-            logger.error(f"SAM 推理失败: {e}，回退到 OpenCV 方案")
-            return self._fallback_segment(img_np)
-
-    def _fallback_segment(self, img_np):
-        """
-        后备方案：使用 OpenCV 进行传统图像分割
-        基于颜色阈值 + 边缘检测 + 轮廓提取
-        """
-        # 转灰度
-        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-
-        # 自适应阈值 + Canny 边缘
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 30, 100)
-
-        # 形态学闭合
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        # 查找轮廓
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # 筛选有效轮廓（面积 > 500 像素）
-        min_area = 500
-        boundaries = []
-        mask = np.zeros(gray.shape, dtype=np.uint8)
-
-        for i, cnt in enumerate(contours):
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
-
-            # 简化多边形
-            epsilon = 0.005 * cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, epsilon, True)
-
-            # 转为 GeoJSON-like 坐标
-            coords = approx.reshape(-1, 2).tolist()
-            if len(coords) < 3:
-                continue
-
-            # 闭合多边形
-            if coords[0] != coords[-1]:
-                coords.append(coords[0])
-
-            geojson = {
-                "type": "Polygon",
-                "coordinates": [[[c[0], c[1]] for c in coords]]
-            }
-
-            boundaries.append({
-                "geojson": geojson,
-                "pixel_area": float(area),
-                "confidence": round(0.7 + np.random.random() * 0.2, 4)  # 后备方案置信度较低
-            })
-
-            # 绘制掩码
-            cv2.drawContours(mask, [cnt], -1, (i + 1) * 30 % 255, -1)
-
-        overlay = self._create_overlay(img_np, mask)
-        return boundaries, overlay
+            boundaries = self._mask_to_boundaries(mask)
+            overlay = self._create_overlay(img_np, mask)
+            return boundaries, overlay
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            if mask_path and os.path.exists(mask_path):
+                os.unlink(mask_path)
 
     def _mask_to_boundaries(self, mask):
-        """将分割掩码转为轮廓列表"""
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        """SAM 掩码 → 轮廓列表（按对象 ID 拆分）"""
         min_area = 200
         boundaries = []
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
+        for obj_id in np.unique(mask):
+            if obj_id == 0:
                 continue
-            epsilon = 0.005 * cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, epsilon, True)
-            coords = approx.reshape(-1, 2).tolist()
-            if len(coords) < 3:
-                continue
-            if coords[0] != coords[-1]:
-                coords.append(coords[0])
+            obj_mask = (mask == obj_id).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(obj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < min_area:
+                    continue
+                epsilon = 0.005 * cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, epsilon, True)
+                coords = approx.reshape(-1, 2).tolist()
+                if len(coords) < 3:
+                    continue
+                if coords[0] != coords[-1]:
+                    coords.append(coords[0])
+                boundaries.append({
+                    "geojson": {"type": "Polygon", "coordinates": [[[c[0], c[1]] for c in coords]]},
+                    "pixel_area": float(area),
+                    "confidence": 0.92
+                })
 
-            boundaries.append({
-                "geojson": {
-                    "type": "Polygon",
-                    "coordinates": [[[c[0], c[1]] for c in coords]]
-                },
-                "pixel_area": float(area),
-                "confidence": 0.92
-            })
+        boundaries.sort(key=lambda x: x["pixel_area"], reverse=True)
+        logger.info(f"SAM 分割完成: {len(boundaries)} 个地块")
         return boundaries
 
     def _create_overlay(self, img_np, mask):
-        """创建原图 + 掩码叠加图"""
-        overlay = img_np.copy()
+        """原图 + 掩码叠加"""
+        overlay = img_np.astype(np.float32).copy()
         mask_bool = mask > 0
-        overlay[mask_bool] = overlay[mask_bool] * 0.5 + np.array([67, 160, 71]) * 0.5
+        green = np.array([67, 160, 71], dtype=np.float32)
+        overlay[mask_bool] = overlay[mask_bool] * 0.5 + green * 0.5
         return Image.fromarray(overlay.astype(np.uint8))

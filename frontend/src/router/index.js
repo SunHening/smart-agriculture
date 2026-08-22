@@ -9,89 +9,95 @@ const routes = [
   // ========== 管理端路由 ==========
   {
     path: '/admin',
-    component: () => import('../views/layout/index.vue'),
+    component: () => import('../views/admin/layout/index.vue'),
     redirect: '/admin/dashboard',
     meta: { role: 'ADMIN' },
     children: [
       {
         path: 'dashboard',
         name: 'AdminDashboard',
-        component: () => import('../views/dashboard/index.vue'),
-        meta: { title: '检测概览', icon: 'DataBoard' }
+        component: () => import('../views/admin/dashboard/index.vue'),
+        meta: { title: '数据看板', icon: 'DataBoard' }
       },
       {
         path: 'user',
         name: 'AdminUser',
-        component: () => import('../views/user/index.vue'),
+        component: () => import('../views/admin/user/index.vue'),
         meta: { title: '用户管理', icon: 'User' }
       },
       {
-        path: 'field',
-        name: 'AdminField',
-        component: () => import('../views/field/index.vue'),
-        meta: { title: '农田管理', icon: 'MapLocation' }
+        path: 'task',
+        name: 'AdminTask',
+        component: () => import('../views/admin/task/index.vue'),
+        meta: { title: '任务监控', icon: 'Picture' }
       },
       {
-        path: 'detection',
-        name: 'AdminDetection',
-        component: () => import('../views/detection/index.vue'),
-        meta: { title: '影像检测', icon: 'Picture' }
+        path: 'model',
+        name: 'AdminModel',
+        component: () => import('../views/admin/model/index.vue'),
+        meta: { title: '模型配置', icon: 'Cpu' }
       },
       {
-        path: 'map',
-        name: 'AdminMap',
-        component: () => import('../views/map/index.vue'),
-        meta: { title: '地图标注', icon: 'MapLocation' }
+        path: 'ai-config',
+        name: 'AdminAiConfig',
+        component: () => import('../views/admin/ai-config/index.vue'),
+        meta: { title: 'AI 配置', icon: 'MagicStick' }
       },
       {
-        path: 'customer-service',
-        name: 'AdminCustomerService',
-        component: () => import('../views/customer-service/index.vue'),
-        meta: { title: '智能客服', icon: 'ChatDotRound' }
+        path: 'knowledge',
+        name: 'AdminKnowledge',
+        component: () => import('../views/admin/knowledge/index.vue'),
+        meta: { title: '知识库', icon: 'Collection' }
       }
     ]
   },
   // ========== 用户端路由 ==========
   {
     path: '/home',
-    component: () => import('../views/user-portal/layout.vue'),
-    redirect: '/home/workbench',
+    component: () => import('../views/portal/layout.vue'),
+    redirect: '/home/overview',
     meta: { role: 'USER' },
     children: [
       {
-        path: 'workbench',
-        name: 'UserWorkbench',
-        component: () => import('../views/user-portal/home/index.vue'),
-        meta: { title: '工作台' }
+        path: 'overview',
+        name: 'UserOverview',
+        component: () => import('../views/portal/overview/index.vue'),
+        meta: { title: '农场概览' }
       },
       {
         path: 'field',
         name: 'UserField',
-        component: () => import('../views/user-portal/field/index.vue'),
-        meta: { title: '我的农田' }
+        component: () => import('../views/portal/field/index.vue'),
+        meta: { title: '地块管理' }
       },
       {
-        path: 'detection',
-        name: 'UserDetection',
-        component: () => import('../views/detection/index.vue'),
-        meta: { title: '影像检测' }
+        path: 'tianditu',
+        name: 'UserTianditu',
+        component: () => import('../views/portal/tianditu/index.vue'),
+        meta: { title: '天地图检测' }
       },
       {
-        path: 'map',
-        name: 'UserMap',
-        component: () => import('../views/map/index.vue'),
-        meta: { title: '地图标注' }
+        path: 'upload',
+        name: 'UserUpload',
+        component: () => import('../views/portal/upload/index.vue'),
+        meta: { title: '上传影像' }
       },
       {
-        path: 'customer-service',
-        name: 'UserCustomerService',
-        component: () => import('../views/customer-service/index.vue'),
-        meta: { title: '智能客服' }
+        path: 'record',
+        name: 'UserRecord',
+        component: () => import('../views/portal/record/index.vue'),
+        meta: { title: '检测记录' }
+      },
+      {
+        path: 'chat',
+        name: 'UserChat',
+        component: () => import('../views/portal/chat/index.vue'),
+        meta: { title: 'AI 问答' }
       },
       {
         path: 'profile',
         name: 'UserProfile',
-        component: () => import('../views/user-portal/profile/index.vue'),
+        component: () => import('../views/portal/profile/index.vue'),
         meta: { title: '个人中心' }
       }
     ]
@@ -119,13 +125,13 @@ router.beforeEach((to, from, next) => {
 
   // 根路径重定向
   if (to.path === '/') {
-    next(user.role === 'ADMIN' ? '/admin/dashboard' : '/home/workbench')
+    next(user.role === 'ADMIN' ? '/admin/dashboard' : '/home/overview')
     return
   }
 
   // 权限校验
   if (to.path.startsWith('/admin') && user.role !== 'ADMIN') {
-    next('/home/workbench')
+    next('/home/overview')
     return
   }
   if (to.path.startsWith('/home') && user.role === 'ADMIN') {

@@ -20,6 +20,7 @@ public class DetectionResult {
     /** 关联农田ID */
     private Long fieldId;
     /** 边界多边形 GeoJSON */
+    @TableField("boundary_geojson")
     private String boundaryGeoJson;
     /** 检测面积(亩) — 基于像素/坐标计算 */
     private BigDecimal detectedArea;

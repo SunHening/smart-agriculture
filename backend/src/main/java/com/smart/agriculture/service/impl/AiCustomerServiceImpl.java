@@ -3,21 +3,27 @@ package com.smart.agriculture.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.smart.agriculture.common.AiProvider;
+import com.smart.agriculture.entity.AiConfig;
 import com.smart.agriculture.entity.AiConversation;
 import com.smart.agriculture.entity.AiMessage;
 import com.smart.agriculture.mapper.AiConversationMapper;
 import com.smart.agriculture.mapper.AiMessageMapper;
+import com.smart.agriculture.service.AiConfigService;
 import com.smart.agriculture.service.AiCustomerService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
- * 智能客服服务实现
- * 当前为规则匹配模式，已预留 AI 服务商接入接口
+ * 大模型交互问答服务实现
+ * 接入 DeepSeek 大模型，支持上下文管理
  */
 @Service
 public class AiCustomerServiceImpl extends ServiceImpl<AiMessageMapper, AiMessage> implements AiCustomerService {
@@ -25,17 +31,25 @@ public class AiCustomerServiceImpl extends ServiceImpl<AiMessageMapper, AiMessag
     @Autowired
     private AiConversationMapper conversationMapper;
 
-    // ========== AI服务商预留接口 ==========
-    // TODO: 替换为真实AI服务商调用
-    // 可选接入:
-    //   1. DeepSeek API  - AiProvider.deepseek()
-    //   2. OpenAI API    - AiProvider.openai()
-    //   3. 本地模型       - AiProvider.local()
+    @Autowired
+    private AiConfigService aiConfigService;
+
+    @Autowired
+    @Qualifier("deepseekProvider")
+    private AiProvider aiProvider;
+
+    /** 上下文窗口大小（带入模型的历史消息条数） */
+    private static final int CONTEXT_SIZE = 10;
 
     @Override
     public Map<String, Object> chat(Long userId, String message) {
         // 获取或创建会话
         AiConversation conversation = getOrCreateConversation(userId);
+
+        // 读取生效的 AI 配置
+        AiConfig config = aiConfigService.getActive();
+        String provider = config != null ? config.getProvider() : "deepseek";
+        String modelName = config != null ? config.getModelName() : null;
 
         // 保存用户消息
         AiMessage userMsg = new AiMessage();
@@ -43,20 +57,27 @@ public class AiCustomerServiceImpl extends ServiceImpl<AiMessageMapper, AiMessag
         userMsg.setSender("USER");
         userMsg.setContent(message);
         userMsg.setMessageType("TEXT");
-        userMsg.setProvider("default");
+        userMsg.setProvider(provider);
+        userMsg.setModelName(modelName);
         userMsg.setCreateTime(LocalDateTime.now());
         save(userMsg);
 
-        // 生成AI回复（当前为规则匹配，预留AI服务商接入）
-        String reply = generateReply(message);
+        // 组装上下文（近 N 条历史消息）
+        List<Map<String, String>> history = buildHistory(conversation.getId());
 
-        // 保存AI回复
+        // 调用大模型
+        String systemPrompt = config != null && config.getSystemPrompt() != null
+                ? config.getSystemPrompt() : "你是智慧农业管理系统的智能助手。";
+        String reply = aiProvider.chat(systemPrompt, history, config);
+
+        // 保存 AI 回复
         AiMessage aiMsg = new AiMessage();
         aiMsg.setConversationId(conversation.getId());
         aiMsg.setSender("AI");
         aiMsg.setContent(reply);
         aiMsg.setMessageType("TEXT");
-        aiMsg.setProvider("default");
+        aiMsg.setProvider(provider);
+        aiMsg.setModelName(modelName);
         aiMsg.setCreateTime(LocalDateTime.now());
         save(aiMsg);
 
@@ -68,6 +89,8 @@ public class AiCustomerServiceImpl extends ServiceImpl<AiMessageMapper, AiMessag
         result.put("conversationId", conversation.getId());
         result.put("userMessage", userMsg);
         result.put("aiMessage", aiMsg);
+        result.put("provider", provider);
+        result.put("modelName", modelName);
         return result;
     }
 
@@ -77,14 +100,7 @@ public class AiCustomerServiceImpl extends ServiceImpl<AiMessageMapper, AiMessag
         Integer pageSize = Integer.parseInt(params.getOrDefault("pageSize", "50").toString());
         Long userId = Long.valueOf(params.get("userId").toString());
 
-        // 获取用户会话
-        LambdaQueryWrapper<AiConversation> convWrapper = new LambdaQueryWrapper<>();
-        convWrapper.eq(AiConversation::getUserId, userId)
-                    .eq(AiConversation::getStatus, "ACTIVE")
-                    .orderByDesc(AiConversation::getUpdateTime)
-                    .last("LIMIT 1");
-        AiConversation conversation = conversationMapper.selectOne(convWrapper);
-
+        AiConversation conversation = getActiveConversation(userId);
         if (conversation == null) {
             return new Page<>(pageNum, pageSize);
         }
@@ -98,10 +114,7 @@ public class AiCustomerServiceImpl extends ServiceImpl<AiMessageMapper, AiMessag
 
     @Override
     public void clearHistory(Long userId) {
-        LambdaQueryWrapper<AiConversation> convWrapper = new LambdaQueryWrapper<>();
-        convWrapper.eq(AiConversation::getUserId, userId)
-                    .eq(AiConversation::getStatus, "ACTIVE");
-        AiConversation conversation = conversationMapper.selectOne(convWrapper);
+        AiConversation conversation = getActiveConversation(userId);
         if (conversation != null) {
             conversation.setStatus("CLOSED");
             conversation.setUpdateTime(LocalDateTime.now());
@@ -111,18 +124,21 @@ public class AiCustomerServiceImpl extends ServiceImpl<AiMessageMapper, AiMessag
 
     // ==================== 私有方法 ====================
 
-    private AiConversation getOrCreateConversation(Long userId) {
+    private AiConversation getActiveConversation(Long userId) {
         LambdaQueryWrapper<AiConversation> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(AiConversation::getUserId, userId)
                .eq(AiConversation::getStatus, "ACTIVE")
                .orderByDesc(AiConversation::getUpdateTime)
                .last("LIMIT 1");
-        AiConversation conversation = conversationMapper.selectOne(wrapper);
+        return conversationMapper.selectOne(wrapper);
+    }
 
+    private AiConversation getOrCreateConversation(Long userId) {
+        AiConversation conversation = getActiveConversation(userId);
         if (conversation == null) {
             conversation = new AiConversation();
             conversation.setUserId(userId);
-            conversation.setTitle("智能客服会话");
+            conversation.setTitle("AI 问答会话");
             conversation.setStatus("ACTIVE");
             conversation.setCreateTime(LocalDateTime.now());
             conversation.setUpdateTime(LocalDateTime.now());
@@ -131,26 +147,21 @@ public class AiCustomerServiceImpl extends ServiceImpl<AiMessageMapper, AiMessag
         return conversation;
     }
 
-    /**
-     * 规则匹配回复（临时代替AI模型）
-     * TODO: 替换为 AiProvider 调用
-     */
-    private String generateReply(String message) {
-        if (message.contains("面积") || message.contains("检测")) {
-            return "您好！本系统支持通过遥感影像和无人机航拍图像自动检测农田面积。您可以在「影像检测」模块上传图片，系统将自动识别农田区域并计算面积。";
+    /** 取近 N 条历史消息作为上下文（升序） */
+    private List<Map<String, String>> buildHistory(Long conversationId) {
+        List<AiMessage> recent = list(new LambdaQueryWrapper<AiMessage>()
+                .eq(AiMessage::getConversationId, conversationId)
+                .orderByDesc(AiMessage::getCreateTime)
+                .last("LIMIT " + CONTEXT_SIZE));
+
+        List<Map<String, String>> history = new ArrayList<>();
+        for (int i = recent.size() - 1; i >= 0; i--) {
+            AiMessage msg = recent.get(i);
+            Map<String, String> item = new HashMap<>();
+            item.put("role", "USER".equals(msg.getSender()) ? "user" : "assistant");
+            item.put("content", msg.getContent());
+            history.add(item);
         }
-        if (message.contains("遥感") || message.contains("卫星")) {
-            return "遥感影像可以从Landsat、Sentinel等卫星获取，系统支持GeoTIFF格式的遥感影像。上传后将通过深度学习模型自动提取农田边界并计算面积。";
-        }
-        if (message.contains("无人机") || message.contains("航拍")) {
-            return "无人机航拍图像可以通过DJI等无人机设备获取。上传后系统会利用计算机视觉技术自动识别农田区域，提取边界并精确计算面积。";
-        }
-        if (message.contains("边界") || message.contains("轮廓")) {
-            return "边界提取基于深度学习语义分割模型（如U-Net、DeepLabV3+），从影像中自动识别农田轮廓并输出GeoJSON格式的多边形边界数据。";
-        }
-        if (message.contains("精度") || message.contains("误差")) {
-            return "系统面积检测精度受影像分辨率（GSD）和模型性能影响。建议使用分辨率优于1m/pixel的遥感影像，检测误差通常在5%以内。";
-        }
-        return "您好！我是智慧农业智能客服，可以为您解答关于农田面积检测、遥感影像处理、无人机航拍分析等方面的问题。请随时提问！";
+        return history;
     }
 }

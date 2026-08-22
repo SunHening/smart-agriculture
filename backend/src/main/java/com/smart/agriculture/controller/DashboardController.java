@@ -2,6 +2,7 @@ package com.smart.agriculture.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.smart.agriculture.common.Result;
+import com.smart.agriculture.entity.FarmField;
 import com.smart.agriculture.entity.ImageTask;
 import com.smart.agriculture.service.FarmFieldService;
 import com.smart.agriculture.service.ImageTaskService;
@@ -13,10 +14,11 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.math.BigDecimal;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
- * 数据概览控制器 — 面向农田面积检测场景
+ * 数据看板控制器 — 全平台汇总 + 实时任务看板
  */
 @RestController
 @RequestMapping("/api/dashboard")
@@ -29,6 +31,7 @@ public class DashboardController {
     @Autowired
     private ImageTaskService imageTaskService;
 
+    /** 全平台数据汇总 */
     @GetMapping("/overview")
     public Result<Map<String, Object>> getOverview() {
         Map<String, Object> data = new HashMap<>();
@@ -37,20 +40,30 @@ public class DashboardController {
         data.put("userCount", userService.count());
         data.put("fieldCount", farmFieldService.count());
 
+        // 面积汇总
+        List<FarmField> fields = farmFieldService.list();
+        BigDecimal totalArea = fields.stream()
+                .map(FarmField::getArea)
+                .filter(java.util.Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal totalDetectedArea = fields.stream()
+                .map(FarmField::getDetectedArea)
+                .filter(java.util.Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        data.put("totalArea", totalArea);
+        data.put("totalDetectedArea", totalDetectedArea);
+
         // 检测统计
         long totalDetections = imageTaskService.count();
         data.put("totalDetections", totalDetections);
 
-        long completedDetections = imageTaskService.count(
-                new LambdaQueryWrapper<ImageTask>().eq(ImageTask::getStatus, "COMPLETED"));
+        long completedDetections = countByStatus("COMPLETED");
         data.put("completedDetections", completedDetections);
 
-        long pendingDetections = imageTaskService.count(
-                new LambdaQueryWrapper<ImageTask>().eq(ImageTask::getStatus, "PENDING"));
+        long pendingDetections = countByStatus("PENDING");
         data.put("pendingDetections", pendingDetections);
 
-        long failedDetections = imageTaskService.count(
-                new LambdaQueryWrapper<ImageTask>().eq(ImageTask::getStatus, "FAILED"));
+        long failedDetections = countByStatus("FAILED");
         data.put("failedDetections", failedDetections);
 
         // 成功率
@@ -64,5 +77,30 @@ public class DashboardController {
         }
 
         return Result.success(data);
+    }
+
+    /** 实时任务看板：任务状态分布 + 最近任务 */
+    @GetMapping("/tasks")
+    public Result<Map<String, Object>> getTasks() {
+        Map<String, Object> data = new HashMap<>();
+
+        data.put("pending", countByStatus("PENDING"));
+        data.put("processing", countByStatus("PROCESSING"));
+        data.put("completed", countByStatus("COMPLETED"));
+        data.put("failed", countByStatus("FAILED"));
+        data.put("total", imageTaskService.count());
+
+        // 最近 10 条任务
+        List<ImageTask> recent = imageTaskService.list(new LambdaQueryWrapper<ImageTask>()
+                .orderByDesc(ImageTask::getCreateTime)
+                .last("LIMIT 10"));
+        data.put("recent", recent);
+
+        return Result.success(data);
+    }
+
+    private long countByStatus(String status) {
+        return imageTaskService.count(
+                new LambdaQueryWrapper<ImageTask>().eq(ImageTask::getStatus, status));
     }
 }

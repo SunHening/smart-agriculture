@@ -10,7 +10,6 @@ import base64
 import logging
 from datetime import datetime
 
-import numpy as np
 from PIL import Image
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -32,7 +31,7 @@ def get_inference():
     if inference is None:
         logger.info("正在加载 SAM-Geo 模型...")
         inference = SamGeoInference(
-            model_type="vit_h",          # vit_h / vit_l / vit_b
+            model_type="vit_b",          # vit_h / vit_l / vit_b
             checkpoint_path=None,         # None = 自动下载 SAM 预训练权重
             device="cpu"                  # CPU 模式；有 GPU 改为 "cuda"
         )
@@ -145,5 +144,123 @@ def detect():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/detect-image", methods=["POST"])
+def detect_image():
+    """
+    直接接收前端截图进行检测（绕过天地图服务端下载）
+    请求体: { "image_base64": "data:image/png;base64,...", "gsd": 1.2 }
+    返回: boundaries + overlay
+    """
+    t_start = time.time()
+    try:
+        data = request.get_json()
+        img_b64 = data.get("image_base64", "")
+        gsd = data.get("gsd", 1.2)
+
+        # 解码 base64
+        if img_b64.startswith("data:"):
+            img_b64 = img_b64.split(",", 1)[1]
+        img_bytes = base64.b64decode(img_b64)
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        logger.info(f"检测上传图像: {image.size}, GSD={gsd}m")
+
+        engine = get_inference()
+        boundaries, overlay = engine.segment(image)
+
+        # 面积计算
+        for b in boundaries:
+            b["area_mu"] = round(b["pixel_area"] * gsd ** 2 / 666.67, 4)
+            b.pop("pixel_area", None)
+        total_area_mu = round(sum(b["area_mu"] for b in boundaries), 4)
+
+        # overlay base64
+        buf = io.BytesIO()
+        overlay.save(buf, format="PNG")
+        overlay_b64 = base64.b64encode(buf.getvalue()).decode()
+        overlay_b64 = f"data:image/png;base64,{overlay_b64}"
+
+        elapsed = int((time.time() - t_start) * 1000)
+        logger.info(f"检测完成: {len(boundaries)} 地块, {total_area_mu} 亩, {elapsed}ms")
+
+        return jsonify({
+            "success": True,
+            "boundaries": boundaries,
+            "total_area_mu": total_area_mu,
+            "field_count": len(boundaries),
+            "processing_time_ms": elapsed,
+            "overlay_base64": overlay_b64,
+            "gsd": gsd
+        })
+    except Exception as e:
+        logger.exception("图像检测失败")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/test-detect", methods=["GET"])
+def test_detect():
+    """使用合成测试图像验证检测算法"""
+    from PIL import Image, ImageDraw
+    import io
+
+    # 生成模拟农田卫星图像
+    w, h = 512, 512
+    img = Image.new("RGB", (w, h), (120, 100, 60))  # 棕色背景
+    draw = ImageDraw.Draw(img)
+
+    # 画多个绿色矩形模拟农田
+    fields = [
+        (50, 50, 200, 180),
+        (220, 40, 420, 200),
+        (40, 220, 200, 420),
+        (220, 250, 410, 400),
+        (340, 140, 460, 230),
+    ]
+    for x1, y1, x2, y2 in fields:
+        draw.rectangle([x1, y1, x2, y2], fill=(80, 145, 65), outline=(40, 100, 30), width=3)
+
+    # 画一条路
+    draw.rectangle([180, 0, 195, 512], fill=(150, 140, 120))
+
+    t_start = time.time()
+    engine = get_inference()
+    boundaries, overlay = engine.segment(img)
+
+    # 面积计算
+    gsd = 1.2  # zoom 17
+    total = 0
+    for b in boundaries:
+        b["area_mu"] = round(b["pixel_area"] * gsd ** 2 / 666.67, 4)
+        b.pop("pixel_area", None)
+        total += b["area_mu"]
+
+    # overlay base64
+    buf_overlay = io.BytesIO()
+    overlay.save(buf_overlay, format="PNG")
+    overlay_b64 = base64.b64encode(buf_overlay.getvalue()).decode()
+    overlay_b64 = f"data:image/png;base64,{overlay_b64}"
+
+    # 原图 base64
+    buf_orig = io.BytesIO()
+    img.save(buf_orig, format="PNG")
+    orig_b64 = base64.b64encode(buf_orig.getvalue()).decode()
+    orig_b64 = f"data:image/png;base64,{orig_b64}"
+
+    elapsed = int((time.time() - t_start) * 1000)
+
+    return jsonify({
+        "success": True,
+        "boundaries": boundaries,
+        "total_area_mu": round(total, 4),
+        "field_count": len(boundaries),
+        "processing_time_ms": elapsed,
+        "image_base64": overlay_b64,
+        "original_base64": orig_b64,
+        "method": "SAM-Geo"
+    })
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # use_reloader=False：关闭热重载。SAM 推理会导入 torch/samgeo 等大库，
+    # 热重载会误判这些库文件变化并中断正在处理的请求（表现为 Connection reset）。
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)

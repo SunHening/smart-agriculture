@@ -88,7 +88,11 @@ def download_tiles(bbox, zoom, tk):
             domain_idx += 1
 
             try:
-                resp = requests.get(url, timeout=10)
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": "http://localhost:5173"
+                }
+                resp = requests.get(url, timeout=10, headers=headers)
                 resp.raise_for_status()
                 tile_img = Image.open(BytesIO(resp.content))
                 canvas.paste(tile_img, ((x - x_min) * TILE_SIZE, (y - y_min) * TILE_SIZE))

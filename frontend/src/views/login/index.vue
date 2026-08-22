@@ -29,8 +29,8 @@
               <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
             </div>
             <div class="feature-text">
-              <span class="feature-title">深度学习智能识别</span>
-              <span class="feature-sub">U-Net / DeepLabV3+ 语义分割自动提取农田</span>
+              <span class="feature-title">SAM-Geo 智能识别</span>
+              <span class="feature-sub">Segment Anything Model 自动分割农田边界</span>
             </div>
           </div>
           <div class="feature-item">
@@ -145,7 +145,7 @@ const handleLogin = async () => {
     if (res.data.user.role === 'ADMIN') {
       router.push('/admin/dashboard')
     } else {
-      router.push('/home/workbench')
+      router.push('/home/overview')
     }
   } finally {
     loading.value = false
