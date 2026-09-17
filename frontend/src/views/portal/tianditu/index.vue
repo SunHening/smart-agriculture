@@ -4,25 +4,86 @@
       <template #header>
         <div class="map-header">
           <span>🗺️ 天地图 · 检测结果</span>
-          <span class="map-tip">框选区域后点击「检测农田」，自动提取地块边界与面积</span>
+          <span class="map-tip">
+            ＋选择目标区域　－排除区域　Box框选　Automatic自动分割
+          </span>
         </div>
       </template>
 
       <div class="map-wrap">
         <div class="map-area">
           <div id="tdt-map" ref="mapRef"></div>
+          
           <div class="map-toolbar">
-            <el-button-group size="small" style="margin-right:8px">
-              <el-button :type="basemap === 'img' ? 'primary' : 'default'" @click="switchBasemap('img')">影像</el-button>
-              <el-button :type="basemap === 'vec' ? 'primary' : 'default'" @click="switchBasemap('vec')">矢量</el-button>
-            </el-button-group>
-            <el-divider direction="vertical" />
-            <el-button type="success" size="small" @click="startDraw" :disabled="drawing">框选区域</el-button>
-            <el-button type="warning" size="small" @click="clearDraw" :disabled="!drawnLayer" style="margin:0 4px">清除</el-button>
-            <el-button type="primary" size="small" @click="detectField" :disabled="!drawnLayer || detecting" :loading="detecting">
-              {{ detecting ? '正在检测...' : '检测农田' }}
-            </el-button>
-          </div>
+
+  <el-button-group size="small" style="margin-right:8px">
+    <el-button
+      :type="basemap === 'img' ? 'primary' : 'default'"
+      @click="switchBasemap('img')"
+    >
+      影像
+    </el-button>
+
+    <el-button
+      :type="basemap === 'vec' ? 'primary' : 'default'"
+      @click="switchBasemap('vec')"
+    >
+      矢量
+    </el-button>
+  </el-button-group>
+
+  <el-divider direction="vertical" />
+
+  <!-- Point + -->
+  <el-button
+    type="primary"
+    size="small"
+    :plain="promptMode !== 'positive'"
+    @click="startPointPrompt('positive')"
+  >
+    ＋ Point
+  </el-button>
+
+  <!-- Point - -->
+  <el-button
+    type="danger"
+    size="small"
+    :plain="promptMode !== 'negative'"
+    @click="startPointPrompt('negative')"
+  >
+    － Point
+  </el-button>
+
+  <!-- Box -->
+  <el-button
+    type="success"
+    size="small"
+    :plain="promptMode !== 'box'"
+    @click="startBoxPrompt"
+  >
+    Box
+  </el-button>
+
+  <!-- Automatic -->
+  <el-button
+    type="warning"
+    size="small"
+    @click="automaticSegment"
+    :loading="automaticLoading"
+  >
+    {{ automaticLoading ? '分析中...' : 'Automatic' }}
+  </el-button>
+
+  <!-- Clear -->
+  <el-button
+    type="info"
+    size="small"
+    @click="clearAll"
+  >
+    清除
+  </el-button>
+
+</div>
         </div>
 
         <aside class="side-panel">
@@ -35,7 +96,9 @@
           <el-divider />
           <div class="panel-section">
             <div class="panel-label">检测结果</div>
-            <div v-if="!result" class="panel-value">框选区域后点击"检测农田"</div>
+            <div v-if="!result" class="panel-value">
+              请选择 Point、Box 或 Automatic 开始分割
+            </div>
             <template v-else>
               <div class="result-grid">
                 <div class="result-item"><span class="rl">面积</span><span class="rv primary">{{ result.area }} 亩</span></div>
@@ -44,14 +107,6 @@
                 <div class="result-item"><span class="rl">耗时</span><span class="rv">{{ result.time }}ms</span></div>
               </div>
             </template>
-          </div>
-          <el-divider />
-          <div class="panel-section">
-            <div class="panel-label">快速定位</div>
-            <el-select v-model="location" @change="goToLocation" placeholder="选择示例地点" style="width:100%">
-              <el-option label="山西·石楼县" value="shilou" />
-              <el-option label="山西·永和县" value="yonghe" />
-            </el-select>
           </div>
         </aside>
       </div>
@@ -65,27 +120,62 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import html2canvas from 'html2canvas'
 import { getFieldList, samGeoDetectImage } from '../../../api'
+import axios from 'axios'
 import { ElMessage } from 'element-plus'
 
 const user = JSON.parse(localStorage.getItem('user') || '{}')
 
 const mapRef = ref(null)
 const basemap = ref('img')
-const location = ref('shilou')
+
 const drawing = ref(false)
-const detecting = ref(false)
+const pointMode = ref(false)
+const promptPoints = ref([])
+
 const result = ref(null)
 const fieldList = ref([])
 const fieldId = ref(null)
 
+// ============================================================
+// SAM Point Prompt 状态
+// ============================================================
+
+// 当前 Prompt 模式：
+// positive = +
+// negative = -
+const promptMode = ref(null)
+
+// Hover 预览是否正在计算
+const hoverLoading = ref(false)
+
+// Point 模式下固定使用的“干净地图截图”
+let promptImageBase64 = null
+
+// Hover 预览图层
+let hoverLayer = null
+
+// 正式 Prompt 点图层
+let promptLayer = null
+
+// 当前 Hover 请求序号
+let hoverRequestId = 0
+
+// 防止鼠标移动过于频繁
+let hoverTimer = null
+
 let map = null
 let currentBase = null
 let currentLabel = null
+
+let promptPointMarkers = []
+
 let drawnLayer = null
 let drawnItems = null
 let drawStartLatLng = null
 let tempRect = null
 let isDrawing = false
+let pointLayer = null
+let pointResultLayer = null
 
 const TK = 'b2d9cc5faa19adaf7b5c80c90e61e5d7'
 const SUBDOMAINS = ['0', '1', '2', '3', '4', '5', '6', '7']
@@ -98,11 +188,6 @@ const createLayer = (layer) =>
 const baseLayers = { img: createLayer('img'), vec: createLayer('vec') }
 const labelLayers = { img: createLayer('cia'), vec: createLayer('cva') }
 
-const focusPoints = {
-  shilou: { coord: [36.96311, 110.80496], zoom: 12, label: '山西石楼县' },
-  yonghe: { coord: [36.70461, 110.71903], zoom: 13, label: '山西永和县' }
-}
-
 const switchBasemap = (type) => {
   if (!map) return
   if (currentBase) map.removeLayer(currentBase)
@@ -114,12 +199,6 @@ const switchBasemap = (type) => {
   basemap.value = type
 }
 
-const goToLocation = (key) => {
-  const t = focusPoints[key]
-  if (!t || !map) return
-  map.setView(t.coord, t.zoom)
-}
-
 const loadFields = async () => {
   try {
     const res = await getFieldList()
@@ -127,21 +206,615 @@ const loadFields = async () => {
   } catch { /* ignore */ }
 }
 
-const startDraw = () => {
+const startPointPrompt = async (mode) => {
   if (!map) return
-  if (!drawnItems) {
-    drawnItems = new L.FeatureGroup()
-    map.addLayer(drawnItems)
+
+  // ----------------------------------------------------
+  // 1. 退出框选模式
+  // ----------------------------------------------------
+
+  if (isDrawing) {
+    isDrawing = false
+
+    map.off('mousedown', onDrawMouseDown)
+    map.off('mousemove', onDrawMouseMove)
+    document.removeEventListener('mouseup', onDrawMouseUp)
+
+    if (tempRect) {
+      map.removeLayer(tempRect)
+      tempRect = null
+    }
+
+    map.dragging.enable()
+    drawing.value = false
   }
-  // 清除上一次的框，避免叠加
-  if (drawnLayer) {
-    drawnItems.clearLayers()
-    drawnLayer = null
+
+  // ----------------------------------------------------
+  // 2. 设置 Point 模式
+  // ----------------------------------------------------
+
+  pointMode.value = true
+  promptMode.value = mode
+
+  console.log(
+    '进入 Point 模式:',
+    mode
+  )
+
+  // ----------------------------------------------------
+  // 3. 创建点图层
+  // ----------------------------------------------------
+
+  if (!pointLayer) {
+    pointLayer = L.layerGroup().addTo(map)
   }
-  drawing.value = true
-  ElMessage.info('按住鼠标左键在地图上拖拽，拉出任意大小的框')
+
+  // ----------------------------------------------------
+  // 4. 第一次进入 Point 模式时生成干净截图
+  // ----------------------------------------------------
+
+  if (!promptImageBase64) {
+
+    try {
+
+      ElMessage.info(
+        '正在准备 SAM 图像，请稍候...'
+      )
+
+      promptImageBase64 =
+        await capturePromptImage()
+
+      console.log(
+        'Point Prompt 图像准备完成'
+      )
+
+    } catch (error) {
+
+      console.error(
+        'Prompt 图像生成失败:',
+        error
+      )
+
+      ElMessage.error(
+        '无法获取地图图像'
+      )
+
+      return
+    }
+  }
+
+  // ----------------------------------------------------
+  // 5. 禁止地图拖动
+  // ----------------------------------------------------
+
   map.dragging.disable()
-  map.on('mousedown', onDrawMouseDown)
+
+  // ----------------------------------------------------
+  // 6. 注册 Point 点击
+  // ----------------------------------------------------
+
+  map.off('click', onPointClick)
+  map.on('click', onPointClick)
+
+    // ----------------------------------------------------
+    // 7. 注册 Hover
+    // ----------------------------------------------------
+
+    map.off('mousemove', onPointMouseMove)
+    map.on('mousemove', onPointMouseMove)
+
+    console.log(
+      'Hover mousemove 已注册'
+    )
+
+  ElMessage.info(
+    mode === 'positive'
+      ? '＋ 前景点：点击目标地块'
+      : '－ 背景点：点击需要排除的区域'
+  )
+}
+
+const predictHoverPoint = async (e) => {
+
+  if (!pointMode.value) {
+    return
+  }
+
+  if (!promptImageBase64) {
+    return
+  }
+
+  const mapEl = document.getElementById('tdt-map')
+
+  if (!mapEl) {
+    return
+  }
+
+  // ----------------------------------------------------
+  // 1. 当前鼠标位置
+  // ----------------------------------------------------
+
+  const mapWidth = mapEl.clientWidth
+  const mapHeight = mapEl.clientHeight
+
+  const imageWidth = promptImageWidth.value
+  const imageHeight = promptImageHeight.value
+
+  const containerPoint = e.containerPoint
+
+  // ----------------------------------------------------
+  // 2. Leaflet 坐标 → SAM 图片像素
+  // ----------------------------------------------------
+
+  const x =
+    e.containerPoint.x *
+    imageWidth /
+    mapWidth
+
+  const y =
+    e.containerPoint.y *
+    imageHeight /
+    mapHeight
+
+  console.log(
+    'Hover 坐标:',
+    'map =',
+    containerPoint.x,
+    containerPoint.y,
+    'image =',
+    x,
+    y
+  )
+  // ----------------------------------------------------
+  // 3. 防止鼠标跑到地图外
+  // ----------------------------------------------------
+
+  if (
+    x < 0 ||
+    y < 0 ||
+    x > imageWidth ||
+    y > imageHeight
+  ) {
+    return
+  }
+
+  // ----------------------------------------------------
+  // 4. 请求序号
+  //
+  // 非常重要：
+  //
+  // 鼠标可能快速移动：
+  //
+  // A 请求
+  // B 请求
+  // C 请求
+  //
+  // 如果 A 最后才返回，
+  // 不能让 A 覆盖 C 的结果。
+  // ----------------------------------------------------
+
+  const requestId = ++hoverRequestId
+
+  hoverLoading.value = true
+
+  try {
+
+    const response = await axios.post(
+      'http://127.0.0.1:5000/predict-point',
+      {
+        image_base64: promptImageBase64,
+        x,
+        y,
+        label: 1
+      },
+      {
+        timeout: 120000
+      }
+    )
+
+    // ----------------------------------------------------
+    // 5. 如果这不是最新请求，直接丢弃
+    // ----------------------------------------------------
+
+    if (requestId !== hoverRequestId) {
+      return
+    }
+
+    const data = response.data
+
+    if (!data.success) {
+      return
+    }
+
+    // ----------------------------------------------------
+    // 6. 删除旧 Hover
+    // ----------------------------------------------------
+
+    if (hoverLayer) {
+      map.removeLayer(hoverLayer)
+      hoverLayer = null
+    }
+
+    hoverLayer = L.layerGroup().addTo(map)
+
+    // ----------------------------------------------------
+    // 7. SAM 边界 → Leaflet
+    // ----------------------------------------------------
+
+    if (data.boundaries) {
+
+      data.boundaries.forEach((boundary) => {
+
+        const coords =
+          boundary.geojson?.coordinates?.[0]
+
+        if (!coords || coords.length < 3) {
+          return
+        }
+
+        const latlngs = coords.map((coord) => {
+
+          const pixelX = coord[0]
+          const pixelY = coord[1]
+
+          const containerX =
+            pixelX *
+            mapWidth /
+            imageWidth
+
+          const containerY =
+            pixelY *
+            mapHeight /
+            imageHeight
+
+          return map.containerPointToLatLng(
+            L.point(
+              containerX,
+              containerY
+            )
+          )
+        })
+        
+
+        if (latlngs.length < 3) {
+          return
+        }
+
+        // ------------------------------------------------
+        // Hover 使用较淡的显示
+        // ------------------------------------------------
+
+        L.polygon(
+          latlngs,
+          {
+            color: '#409eff',
+            weight: 2,
+            fillColor: '#409eff',
+            fillOpacity: 0.18,
+            interactive: false
+          }
+        ).addTo(hoverLayer)
+      })
+    }
+
+  } catch (error) {
+
+    // Hover 本身不是关键操作
+    // 所以不要每次失败都弹 Element Message
+
+    console.debug(
+      'Hover prediction failed:',
+      error.message
+    )
+
+  } finally {
+
+    if (requestId === hoverRequestId) {
+      hoverLoading.value = false
+    }
+  }
+}
+
+// ============================================================
+// Point Hover Preview
+// ============================================================
+
+const onPointMouseMove = (e) => {
+
+  console.log('Hover:', e.containerPoint.x, e.containerPoint.y)
+
+  if (!pointMode.value) {
+    return
+  }
+
+  if (!promptImageBase64) {
+    return
+  }
+
+  // ----------------------------------------------------
+  // 防止鼠标移动过快产生大量请求
+  // ----------------------------------------------------
+
+  if (hoverTimer) {
+    clearTimeout(hoverTimer)
+  }
+
+  hoverTimer = setTimeout(() => {
+    predictHoverPoint(e)
+  }, 150)
+}
+
+const onPointClick = async (e) => {
+  
+  if (!pointMode.value) return
+
+  console.log('========== POINT DEBUG ==========')
+
+  const mapEl = document.getElementById('tdt-map')
+
+  console.log('DOM client:', {
+    width: mapEl?.clientWidth,
+    height: mapEl?.clientHeight
+  })
+
+  console.log('DOM rect:', {
+    width: mapEl?.getBoundingClientRect().width,
+    height: mapEl?.getBoundingClientRect().height
+  })  
+
+  console.log('Leaflet map:', {
+    width: map.getSize().x,
+    height: map.getSize().y
+  })
+
+  console.log('containerPoint:', {
+    x: e.containerPoint.x,
+    y: e.containerPoint.y
+  })
+
+  console.log('promptImage:', {
+    width: promptImageWidth.value,
+    height: promptImageHeight.value
+  })
+
+  console.log('devicePixelRatio:', window.devicePixelRatio)
+
+  console.log('=================================')
+
+  // ----------------------------------------------------
+  // 1. 取消当前 Hover 请求
+  // ----------------------------------------------------
+
+  hoverRequestId++
+
+  if (hoverTimer) {
+    clearTimeout(hoverTimer)
+    hoverTimer = null
+  }
+
+  // 清除 Hover 预览
+  if (hoverLayer) {
+    map.removeLayer(hoverLayer)
+    hoverLayer = null
+  }
+
+  try {
+    // ----------------------------------------------------
+    // 2. Point 模式必须使用进入 Point 模式时保存的干净截图
+    // ----------------------------------------------------
+
+    if (!promptImageBase64) {
+      throw new Error('Point Prompt 图像不存在')
+    }
+
+    const mapWidth = mapEl.clientWidth
+    const mapHeight = mapEl.clientHeight
+
+    // 当前点击位置
+    // 因为 promptImageBase64 是进入 Point 模式时保存的
+    // 干净地图截图，所以这里直接使用地图容器坐标
+    const imageWidth = promptImageWidth.value
+    const imageHeight = promptImageHeight.value
+
+    const x =
+      e.containerPoint.x *
+      imageWidth /
+      mapWidth
+
+    const y =
+      e.containerPoint.y *
+      imageHeight /
+      mapHeight
+
+    // ----------------------------------------------------
+    // 3. 判断是 + 点还是 - 点
+    // ----------------------------------------------------
+
+    const label =
+      promptMode.value === 'negative'
+        ? 0
+        : 1
+
+    console.log('正式 Point:', {
+      mode: promptMode.value,
+      x,
+      y,
+      label
+    })
+
+    // ----------------------------------------------------
+    // 4. 显示用户点击的点
+    // ----------------------------------------------------
+
+    const marker = L.circleMarker(e.latlng, {
+      radius: 6,
+      color: '#ffffff',
+      weight: 2,
+
+      // +
+      fillColor: label === 1
+        ? '#43a047'
+        : '#f56c6c',
+
+      fillOpacity: 1,
+      interactive: false
+    })
+
+    marker.addTo(pointLayer)
+
+    // ----------------------------------------------------
+    // 5. 保存 Prompt 点
+    // ----------------------------------------------------
+
+    promptPoints.value.push({
+      latlng: e.latlng,
+      x,
+      y,
+      label
+    })
+
+    console.log(
+      '当前 Prompt 点:',
+      promptPoints.value
+    )
+
+    // ----------------------------------------------------
+    // 6. 调用 Python SAM
+    // ----------------------------------------------------
+
+    ElMessage.info(
+      label === 1
+        ? '正在使用前景点进行分割...'
+        : '正在使用背景点排除区域...'
+    )
+
+    const response = await axios.post(
+      'http://127.0.0.1:5000/predict-point',
+      {
+        image_base64: promptImageBase64,
+        x,
+        y,
+        label
+      },
+      {
+        timeout: 120000
+      }
+    )
+
+    const data = response.data
+
+    console.log('SAM Point result:', data)
+
+    if (!data.success) {
+      throw new Error(
+        data.error || 'Point 分割失败'
+      )
+    }
+
+    // ----------------------------------------------------
+    // 7. 清除上一次 SAM 结果
+    // ----------------------------------------------------
+
+    if (pointResultLayer) {
+      map.removeLayer(pointResultLayer)
+      pointResultLayer = null
+    }
+
+    pointResultLayer = L.layerGroup().addTo(map)
+
+    // ----------------------------------------------------
+    // 8. SAM 像素坐标 → Leaflet 坐标
+    // ----------------------------------------------------
+
+    if (data.boundaries) {
+
+      data.boundaries.forEach((boundary) => {
+
+        const coords =
+          boundary.geojson?.coordinates?.[0]
+
+        if (!coords || coords.length < 3) {
+          return
+        }
+
+        const latlngs = coords.map((coord) => {
+          const pixelX = coord[0]
+          const pixelY = coord[1]
+
+          const containerX =
+            pixelX *
+            mapWidth /
+            imageWidth
+
+          const containerY =
+            pixelY *
+            mapHeight /
+            imageHeight
+
+          return map.containerPointToLatLng(
+            L.point(
+              containerX,
+              containerY
+            )
+          )
+        })
+
+        L.polygon(
+          latlngs,
+          {
+            color: '#43a047',
+            weight: 2,
+            fillColor: '#43a047',
+            fillOpacity: 0.30,
+            interactive: false
+          }
+        )
+          .addTo(pointResultLayer)
+          .bindPopup(
+            `SAM Confidence: ${
+              (data.confidence * 100).toFixed(1)
+            }%`
+          )
+      })
+    }
+
+    // ----------------------------------------------------
+    // 9. 更新右侧结果
+    // ----------------------------------------------------
+
+    result.value = {
+      area: '-',
+      confidence: (
+        data.confidence * 100
+      ).toFixed(1),
+      fieldCount:
+        data.boundaries?.length || 0,
+      time:
+        data.processing_time_ms
+    }
+
+    ElMessage.success(
+      `Point 分割完成，Confidence ${
+        (data.confidence * 100).toFixed(1)
+      }%`
+    )
+
+  } catch (error) {
+
+    console.error(
+      'Point prediction error:',
+      error
+    )
+
+    ElMessage.error(
+      'Point 分割失败：' +
+      (
+        error.response?.data?.error ||
+        error.message ||
+        'SAM 服务异常'
+      )
+    )
+  }
 }
 
 const onDrawMouseDown = (e) => {
@@ -191,18 +864,103 @@ const onDrawMouseUp = (e) => {
 }
 
 const clearDraw = () => {
+  // 退出 Point 模式
+  if (pointMode.value) {
+    pointMode.value = false
+    promptPoints.value = []
+
+    if (map) {
+      map.off('click', onPointClick)
+      map.off('mousemove', onPointMouseMove)
+      map.dragging.enable()
+    }
+
+    if (pointLayer) {
+      map.removeLayer(pointLayer)
+      pointLayer = null
+    }
+
+    if (pointResultLayer) {
+      map.removeLayer(pointResultLayer)
+      pointResultLayer = null
+    }
+
+    if (hoverLayer) {
+      map.removeLayer(hoverLayer)
+      hoverLayer = null
+    }
+  }
+
+  // 退出框选模式
   if (isDrawing) {
     isDrawing = false
+
     map.off('mousedown', onDrawMouseDown)
     map.off('mousemove', onDrawMouseMove)
+
     document.removeEventListener('mouseup', onDrawMouseUp)
-    if (tempRect) { map.removeLayer(tempRect); tempRect = null }
+
+    if (tempRect) {
+      map.removeLayer(tempRect)
+      tempRect = null
+    }
+
     map.dragging.enable()
     drawing.value = false
   }
-  if (drawnItems) drawnItems.clearLayers()
+
+  // 清除框选结果
+  if (drawnItems) {
+    drawnItems.clearLayers()
+  }
+
   drawnLayer = null
   result.value = null
+}
+
+const promptImageWidth = ref(0)
+const promptImageHeight = ref(0)
+
+const capturePromptImage = async () => {
+  const mapEl = document.getElementById('tdt-map')
+
+  if (!mapEl) {
+    throw new Error('地图容器不存在')
+  }
+
+  const mapWidth = mapEl.clientWidth
+  const mapHeight = mapEl.clientHeight
+
+  const canvas = await html2canvas(mapEl, {
+    useCORS: true,
+    allowTaint: true,
+
+    // 非常重要：
+    // 强制截图与 Leaflet CSS 像素保持 1:1
+    scale: 1,
+
+    width: mapWidth,
+    height: mapHeight
+  })
+
+  promptImageWidth.value = canvas.width
+  promptImageHeight.value = canvas.height
+
+  console.log('========== SAM Prompt Image ==========')
+
+  console.log('Leaflet CSS:', {
+    width: mapWidth,
+    height: mapHeight
+  })
+
+  console.log('Canvas:', {
+    width: canvas.width,
+    height: canvas.height
+  })
+
+  console.log('=======================================')
+
+  return canvas.toDataURL('image/png')
 }
 
 const detectField = async () => {
@@ -210,7 +968,7 @@ const detectField = async () => {
   detecting.value = true
   try {
     const mapEl = document.getElementById('tdt-map')
-    const canvas = await html2canvas(mapEl, { useCORS: true, allowTaint: true })
+    const canvas = await html2canvas(mapEl, { useCORS: true, allowTaint: true, scale: 1 })
     const imgBase64 = canvas.toDataURL('image/png')
 
     const zoom = map.getZoom()
@@ -257,7 +1015,7 @@ onMounted(async () => {
   await nextTick()
   if (!mapRef.value) return
   map = L.map('tdt-map', {
-    center: focusPoints.shilou.coord,
+    center: [36.96311, 110.80496],
     zoom: 17,
     zoomControl: false,
     attributionControl: false
@@ -269,10 +1027,25 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+
   if (isDrawing) {
-    document.removeEventListener('mouseup', onDrawMouseUp)
+    document.removeEventListener(
+      'mouseup',
+      onDrawMouseUp
+    )
   }
-  if (map) { map.remove(); map = null }
+
+  if (hoverTimer) {
+    clearTimeout(hoverTimer)
+    hoverTimer = null
+  }
+
+  if (map) {
+    map.off('mousemove', onPointMouseMove)
+    map.off('click', onPointClick)
+    map.remove()
+    map = null
+  }
 })
 </script>
 

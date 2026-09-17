@@ -3,6 +3,8 @@ backend/target/
 *.class
 *.jar
 *.war
+
+# ========== Logs ==========
 *.log
 
 # ========== Node ==========
@@ -16,6 +18,13 @@ python_service/venv/
 python_service/.venv/
 *.pyc
 *.pyo
+
+# ========= AI Model ==========
+python_service/models/
+*.pth
+
+# ========== Test ==========
+python_service/test.jpg
 
 # ========== IDE ==========
 .idea/
@@ -31,7 +40,7 @@ Thumbs.db
 desktop.ini
 
 # ========== Uploads ==========
-backend/uploads/*
+backend/uploads/
 
 # ========== Env ==========
 .env

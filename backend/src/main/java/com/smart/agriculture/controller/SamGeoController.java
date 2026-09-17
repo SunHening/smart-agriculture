@@ -60,6 +60,7 @@ public class SamGeoController {
             pythonReq.put("bbox", params.get("bbox"));
             pythonReq.put("zoom", params.getOrDefault("zoom", 17));
             pythonReq.put("method", "auto");
+            pythonReq.put("tk", params.get("tk"));
 
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);

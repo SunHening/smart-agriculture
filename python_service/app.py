@@ -1,266 +1,409 @@
-"""
-SAM-Geo 农田检测微服务
-POST /detect — 接收地图区域坐标，下载天地图影像，运行 SAM 分割，返回农田边界
-"""
-import os
-import io
-import json
-import time
-import base64
-import logging
-from datetime import datetime
+from io import BytesIO
 
+import numpy as np
 from PIL import Image
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
-from tianditu_downloader import download_tiles
-from sam_geo_inference import SamGeoInference
+from config import CHECKPOINT_PATH, DEVICE, MODEL_TYPE
+from service.sam_runtime import SamRuntime
+from service.session_manager import SessionManager
+from service.segmentation_service import SegmentationService
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-# 全局模型实例（延迟加载）
-inference = None
 
-def get_inference():
-    global inference
-    if inference is None:
-        logger.info("正在加载 SAM-Geo 模型...")
-        inference = SamGeoInference(
-            model_type="vit_b",          # vit_h / vit_l / vit_b
-            checkpoint_path=None,         # None = 自动下载 SAM 预训练权重
-            device="cpu"                  # CPU 模式；有 GPU 改为 "cuda"
-        )
-        logger.info("SAM-Geo 模型加载完成")
-    return inference
+# ============================================================
+# 核心服务初始化
+# ============================================================
+
+runtime = SamRuntime(
+    checkpoint_path=CHECKPOINT_PATH,
+    model_type=MODEL_TYPE,
+    device=DEVICE,
+)
+
+session_manager = SessionManager()
+
+segmentation_service = SegmentationService(
+    runtime=runtime,
+    session_manager=session_manager,
+)
 
 
-@app.route("/health", methods=["GET"])
+# ============================================================
+# Health
+# ============================================================
+
+@app.get("/health")
 def health():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
-
-
-@app.route("/detect", methods=["POST"])
-def detect():
-    """
-    请求体:
-    {
-        "bbox": { "north": 36.965, "south": 36.960, "east": 110.808, "west": 110.802 },
-        "zoom": 17,                          // 天地图缩放级别
-        "tk": "b2d9cc5faa19adaf7b5c80c90e61e5d7",  // 天地图 API Key
-        "field_name": "可选-农田名称",
-        "method": "auto"                      // "auto" 自动分割 / "prompt" 提示点分割
-    }
-
-    返回:
-    {
-        "success": true,
-        "boundaries": [   // 多个农田地块
-            {
-                "geojson": { "type": "Polygon", "coordinates": [...] },
-                "area_mu": 5.48,
-                "confidence": 0.95
-            }
-        ],
-        "total_area_mu": 12.35,
-        "image_base64": "...",   // 原图 + 掩码叠加的 base64
-        "processing_time_ms": 3200
-    }
-    """
-    t_start = time.time()
-
-    try:
-        data = request.get_json()
-        if not data or "bbox" not in data:
-            return jsonify({"success": False, "error": "缺少 bbox 参数"}), 400
-
-        bbox = data["bbox"]
-        zoom = data.get("zoom", 17)
-        tk = data.get("tk", "b2d9cc5faa19adaf7b5c80c90e61e5d7")
-
-        logger.info(f"检测区域: {bbox}, zoom={zoom}")
-
-        # Step 1: 下载天地图影像
-        logger.info("下载天地图影像...")
-        image = download_tiles(bbox, zoom, tk)
-        if image is None:
-            return jsonify({"success": False, "error": "天地图影像下载失败"}), 500
-
-        # Step 2: SAM-Geo 分割
-        logger.info(f"运行 SAM-Geo 分割 (图像尺寸: {image.size})...")
-        engine = get_inference()
-        method = data.get("method", "auto")
-
-        if method == "prompt":
-            # 提示点模式：使用 bbox 中心点作为提示
-            center_x = image.width // 2
-            center_y = image.height // 2
-            prompts = [{"type": "point", "data": [center_x, center_y], "label": 1}]
-        else:
-            prompts = None  # 自动模式
-
-        boundaries, mask_overlay = engine.segment(image, prompts=prompts)
-
-        # Step 3: 计算面积（像素 → 实际面积）
-        # 天地图各级别分辨率(m/pixel): zoom 17 ≈ 1.2m/px
-        resolutions = {15: 4.8, 16: 2.4, 17: 1.2, 18: 0.6, 19: 0.3}
-        gsd = resolutions.get(zoom, 1.2)  # 默认 zoom 17
-
-        for b in boundaries:
-            pixel_area = b.get("pixel_area", 0)
-            # 像素面积 × GSD² = 平方米
-            sqm = pixel_area * (gsd ** 2)
-            # 转换为亩 (1亩 = 666.67 m²)
-            b["area_mu"] = round(sqm / 666.67, 4)
-            b.pop("pixel_area", None)
-
-        total_area_mu = round(sum(b["area_mu"] for b in boundaries), 4)
-
-        # Step 4: 生成叠加图 base64
-        overlay_b64 = None
-        if mask_overlay is not None:
-            buf = io.BytesIO()
-            mask_overlay.save(buf, format="PNG")
-            overlay_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        elapsed = int((time.time() - t_start) * 1000)
-        logger.info(f"检测完成: {len(boundaries)} 个地块, 总面积 {total_area_mu} 亩, 耗时 {elapsed}ms")
-
-        return jsonify({
-            "success": True,
-            "boundaries": boundaries,
-            "total_area_mu": total_area_mu,
-            "image_base64": overlay_b64,
-            "processing_time_ms": elapsed,
-            "gsd": gsd
-        })
-
-    except Exception as e:
-        logger.exception("检测失败")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/detect-image", methods=["POST"])
-def detect_image():
-    """
-    直接接收前端截图进行检测（绕过天地图服务端下载）
-    请求体: { "image_base64": "data:image/png;base64,...", "gsd": 1.2 }
-    返回: boundaries + overlay
-    """
-    t_start = time.time()
-    try:
-        data = request.get_json()
-        img_b64 = data.get("image_base64", "")
-        gsd = data.get("gsd", 1.2)
-
-        # 解码 base64
-        if img_b64.startswith("data:"):
-            img_b64 = img_b64.split(",", 1)[1]
-        img_bytes = base64.b64decode(img_b64)
-        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
-        logger.info(f"检测上传图像: {image.size}, GSD={gsd}m")
-
-        engine = get_inference()
-        boundaries, overlay = engine.segment(image)
-
-        # 面积计算
-        for b in boundaries:
-            b["area_mu"] = round(b["pixel_area"] * gsd ** 2 / 666.67, 4)
-            b.pop("pixel_area", None)
-        total_area_mu = round(sum(b["area_mu"] for b in boundaries), 4)
-
-        # overlay base64
-        buf = io.BytesIO()
-        overlay.save(buf, format="PNG")
-        overlay_b64 = base64.b64encode(buf.getvalue()).decode()
-        overlay_b64 = f"data:image/png;base64,{overlay_b64}"
-
-        elapsed = int((time.time() - t_start) * 1000)
-        logger.info(f"检测完成: {len(boundaries)} 地块, {total_area_mu} 亩, {elapsed}ms")
-
-        return jsonify({
-            "success": True,
-            "boundaries": boundaries,
-            "total_area_mu": total_area_mu,
-            "field_count": len(boundaries),
-            "processing_time_ms": elapsed,
-            "overlay_base64": overlay_b64,
-            "gsd": gsd
-        })
-    except Exception as e:
-        logger.exception("图像检测失败")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/test-detect", methods=["GET"])
-def test_detect():
-    """使用合成测试图像验证检测算法"""
-    from PIL import Image, ImageDraw
-    import io
-
-    # 生成模拟农田卫星图像
-    w, h = 512, 512
-    img = Image.new("RGB", (w, h), (120, 100, 60))  # 棕色背景
-    draw = ImageDraw.Draw(img)
-
-    # 画多个绿色矩形模拟农田
-    fields = [
-        (50, 50, 200, 180),
-        (220, 40, 420, 200),
-        (40, 220, 200, 420),
-        (220, 250, 410, 400),
-        (340, 140, 460, 230),
-    ]
-    for x1, y1, x2, y2 in fields:
-        draw.rectangle([x1, y1, x2, y2], fill=(80, 145, 65), outline=(40, 100, 30), width=3)
-
-    # 画一条路
-    draw.rectangle([180, 0, 195, 512], fill=(150, 140, 120))
-
-    t_start = time.time()
-    engine = get_inference()
-    boundaries, overlay = engine.segment(img)
-
-    # 面积计算
-    gsd = 1.2  # zoom 17
-    total = 0
-    for b in boundaries:
-        b["area_mu"] = round(b["pixel_area"] * gsd ** 2 / 666.67, 4)
-        b.pop("pixel_area", None)
-        total += b["area_mu"]
-
-    # overlay base64
-    buf_overlay = io.BytesIO()
-    overlay.save(buf_overlay, format="PNG")
-    overlay_b64 = base64.b64encode(buf_overlay.getvalue()).decode()
-    overlay_b64 = f"data:image/png;base64,{overlay_b64}"
-
-    # 原图 base64
-    buf_orig = io.BytesIO()
-    img.save(buf_orig, format="PNG")
-    orig_b64 = base64.b64encode(buf_orig.getvalue()).decode()
-    orig_b64 = f"data:image/png;base64,{orig_b64}"
-
-    elapsed = int((time.time() - t_start) * 1000)
-
     return jsonify({
-        "success": True,
-        "boundaries": boundaries,
-        "total_area_mu": round(total, 4),
-        "field_count": len(boundaries),
-        "processing_time_ms": elapsed,
-        "image_base64": overlay_b64,
-        "original_base64": orig_b64,
-        "method": "SAM-Geo"
+        "status": "ok",
+        "service": "sam-segmentation",
     })
 
 
+# ============================================================
+# 创建 SAM Session
+# ============================================================
+
+@app.post("/sam/sessions")
+def create_session():
+    """
+    创建一个 SAM ImageSession。
+
+    请求：
+        multipart/form-data
+        image=<图片文件>
+
+    返回：
+        {
+            "session_id": "...",
+            "width": 1920,
+            "height": 1080,
+            "original_size": [1080, 1920]
+        }
+    """
+
+    if "image" not in request.files:
+        return jsonify({
+            "error": "缺少 image 文件"
+        }), 400
+
+    file = request.files["image"]
+
+    if file.filename == "":
+        return jsonify({
+            "error": "图片文件名为空"
+        }), 400
+
+    try:
+        # ----------------------------------------------------
+        # 1. 读取图片
+        # ----------------------------------------------------
+
+        image = Image.open(file.stream).convert("RGB")
+
+        image_np = np.array(image)
+
+        # ----------------------------------------------------
+        # 2. 创建 Session
+        # ----------------------------------------------------
+
+        result = segmentation_service.create_session(
+            image=image_np
+        )
+
+        # ----------------------------------------------------
+        # 3. 返回 Session 信息
+        # ----------------------------------------------------
+
+        return jsonify(result), 201
+
+    except Exception as e:
+        app.logger.exception("创建 SAM Session 失败")
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# 查询 Session
+# ============================================================
+
+@app.get("/sam/sessions/<session_id>")
+def get_session(session_id: str):
+    """
+    查询 Session 是否存在以及基本信息。
+    """
+
+    session = session_manager.get(session_id)
+
+    if session is None:
+        return jsonify({
+            "error": "Session 不存在"
+        }), 404
+
+    return jsonify({
+        "session_id": session.session_id,
+        "width": session.width,
+        "height": session.height,
+        "original_size": list(session.original_size),
+        "created_at": session.created_at.isoformat(),
+        "last_accessed_at": session.last_accessed_at.isoformat(),
+    })
+
+
+# ============================================================
+# 点提示预测
+# ============================================================
+
+@app.post("/sam/sessions/<session_id>/predictions")
+def predict_points(session_id: str):
+    """
+    根据 Session + 点提示生成 raw mask。
+
+    请求 JSON：
+
+    {
+        "points": [
+            {
+                "x": 500,
+                "y": 300,
+                "label": 1
+            },
+            {
+                "x": 700,
+                "y": 400,
+                "label": 0
+            }
+        ],
+        "multimask_output": false
+    }
+
+    返回：
+        image/png
+
+    PNG：
+        0   = 背景
+        255 = mask
+    """
+
+    # --------------------------------------------------------
+    # 1. 检查 Session
+    # --------------------------------------------------------
+
+    session = session_manager.get(session_id)
+
+    if session is None:
+        return jsonify({
+            "error": "Session 不存在"
+        }), 404
+
+    # --------------------------------------------------------
+    # 2. 读取 JSON
+    # --------------------------------------------------------
+
+    data = request.get_json(silent=True)
+
+    if data is None:
+        return jsonify({
+            "error": "请求必须是 JSON"
+        }), 400
+
+    points = data.get("points")
+
+    if not isinstance(points, list):
+        return jsonify({
+            "error": "points 必须是数组"
+        }), 400
+
+    if len(points) == 0:
+        return jsonify({
+            "error": "至少需要一个点"
+        }), 400
+
+    # --------------------------------------------------------
+    # 3. 转换点坐标
+    # --------------------------------------------------------
+
+    point_coords = []
+    point_labels = []
+
+    for point in points:
+
+        if not isinstance(point, dict):
+            return jsonify({
+                "error": "每个 point 必须是对象"
+            }), 400
+
+        if "x" not in point or "y" not in point:
+            return jsonify({
+                "error": "point 必须包含 x 和 y"
+            }), 400
+
+        x = float(point["x"])
+        y = float(point["y"])
+
+        label = int(point.get("label", 1))
+
+        if label not in (0, 1):
+            return jsonify({
+                "error": "label 必须是 0 或 1"
+            }), 400
+
+        # ----------------------------------------------------
+        # 坐标范围检查
+        # ----------------------------------------------------
+
+        if x < 0 or x >= session.width:
+            return jsonify({
+                "error": f"x 超出图片范围: {x}"
+            }), 400
+
+        if y < 0 or y >= session.height:
+            return jsonify({
+                "error": f"y 超出图片范围: {y}"
+            }), 400
+
+        point_coords.append([x, y])
+        point_labels.append(label)
+
+    point_coords = np.asarray(
+        point_coords,
+        dtype=np.float32
+    )
+
+    point_labels = np.asarray(
+        point_labels,
+        dtype=np.int32
+    )
+
+    # --------------------------------------------------------
+    # 4. multimask_output
+    # --------------------------------------------------------
+
+    multimask_output = bool(
+        data.get("multimask_output", False)
+    )
+
+    # --------------------------------------------------------
+    # 5. 调用业务层
+    # --------------------------------------------------------
+
+    try:
+
+        result = segmentation_service.predict_points(
+            session_id=session_id,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            multimask_output=multimask_output,
+        )
+
+    except ValueError as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 400
+
+    except Exception as e:
+
+        app.logger.exception("SAM prediction 失败")
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+    # --------------------------------------------------------
+    # 6. 获取 raw mask
+    # --------------------------------------------------------
+
+    mask = result["mask"]
+
+    # torch Tensor → numpy
+    if hasattr(mask, "detach"):
+        mask = mask.detach().cpu().numpy()
+
+    mask = np.asarray(mask)
+
+    # --------------------------------------------------------
+    # 7. 去除多余维度
+    # --------------------------------------------------------
+
+    mask = np.squeeze(mask)
+
+    if mask.ndim != 2:
+        return jsonify({
+            "error": f"mask 维度错误: {mask.shape}"
+        }), 500
+
+    # --------------------------------------------------------
+    # 8. 转换成 0 / 255
+    # --------------------------------------------------------
+
+    mask_uint8 = (
+        mask.astype(np.uint8) * 255
+    )
+
+    # --------------------------------------------------------
+    # 9. 编码成 PNG
+    # --------------------------------------------------------
+
+    mask_image = Image.fromarray(
+        mask_uint8,
+        mode="L"
+    )
+
+    buffer = BytesIO()
+
+    mask_image.save(
+        buffer,
+        format="PNG"
+    )
+
+    buffer.seek(0)
+
+    # --------------------------------------------------------
+    # 10. 返回 mask
+    # --------------------------------------------------------
+
+    response = send_file(
+        buffer,
+        mimetype="image/png",
+        as_attachment=False,
+    )
+
+    # 把一些推理信息放到 HTTP Header
+    response.headers["X-SAM-Score"] = str(
+        result.get("score", "")
+    )
+
+    response.headers["X-SAM-Width"] = str(
+        session.width
+    )
+
+    response.headers["X-SAM-Height"] = str(
+        session.height
+    )
+
+    return response
+
+
+# ============================================================
+# 删除 Session
+# ============================================================
+
+@app.delete("/sam/sessions/<session_id>")
+def delete_session(session_id: str):
+    """
+    删除 SAM Session。
+    """
+
+    deleted = segmentation_service.delete_session(
+        session_id
+    )
+
+    if not deleted:
+        return jsonify({
+            "error": "Session 不存在"
+        }), 404
+
+    return jsonify({
+        "message": "Session 已删除",
+        "session_id": session_id,
+    })
+
+
+# ============================================================
+# 启动
+# ============================================================
+
 if __name__ == "__main__":
-    # use_reloader=False：关闭热重载。SAM 推理会导入 torch/samgeo 等大库，
-    # 热重载会误判这些库文件变化并中断正在处理的请求（表现为 Connection reset）。
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=True,
+    )
