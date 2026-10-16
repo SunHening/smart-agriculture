@@ -150,6 +150,8 @@ const hoverLoading = ref(false)
 
 // Point 模式下固定使用的“干净地图截图”
 let promptImageBase64 = null
+let samSessionId = null
+let samSessionPromise = null
 
 // Hover 预览图层
 let hoverLayer = null
@@ -403,6 +405,7 @@ const predictHoverPoint = async (e) => {
       'http://127.0.0.1:5000/predict-point',
       {
         image_base64: promptImageBase64,
+        session_id: await ensureSamSession(),
         x,
         y,
         label: 1
@@ -692,6 +695,7 @@ const onPointClick = async (e) => {
       'http://127.0.0.1:5000/predict-point',
       {
         image_base64: promptImageBase64,
+        session_id: await ensureSamSession(),
         x,
         y,
         label
@@ -921,6 +925,35 @@ const clearDraw = () => {
 const promptImageWidth = ref(0)
 const promptImageHeight = ref(0)
 
+const ensureSamSession = async () => {
+  if (samSessionId) return samSessionId
+  if (samSessionPromise) return samSessionPromise
+  if (!promptImageBase64) throw new Error('SAM 截图尚未准备好')
+
+  samSessionPromise = (async () => {
+    const imageBlob = await fetch(promptImageBase64).then(response => {
+      if (!response.ok) throw new Error('无法读取 SAM 截图')
+      return response.blob()
+    })
+    const formData = new FormData()
+    formData.append('image', imageBlob, 'sam-prompt.png')
+    const response = await axios.post(
+      'http://127.0.0.1:5000/sam/sessions',
+      formData,
+      { timeout: 120000 }
+    )
+    samSessionId = response.data.session_id
+    return samSessionId
+  })()
+
+  try {
+    return await samSessionPromise
+  } catch (error) {
+    samSessionPromise = null
+    throw error
+  }
+}
+
 const capturePromptImage = async () => {
   const mapEl = document.getElementById('tdt-map')
 
@@ -943,6 +976,9 @@ const capturePromptImage = async () => {
     height: mapHeight
   })
 
+  // 截图内容或视口变化后，旧 embedding 不再适用。
+  samSessionId = null
+  samSessionPromise = null
   promptImageWidth.value = canvas.width
   promptImageHeight.value = canvas.height
 
