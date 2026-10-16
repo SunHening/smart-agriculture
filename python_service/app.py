@@ -396,6 +396,106 @@ def predict_points(session_id: str):
     return response
 
 
+
+# ============================================================
+# 兼容现有 Vue Point 工作流，并复用 SAM Session embedding
+# ============================================================
+
+@app.post("/predict-point")
+def predict_point_compat():
+    """兼容旧版 Vue 请求；首个请求创建 Session，后续请求复用 embedding。"""
+    import base64
+    import time
+    import cv2
+
+    started_at = time.perf_counter()
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id")
+    image_base64 = data.get("image_base64")
+    session = session_manager.get(session_id) if session_id else None
+
+    try:
+        # 第一次请求或 Session 失效时，使用前端截图创建 Session。
+        if session is None:
+            if not image_base64:
+                return jsonify({"success": False, "error": "缺少 image_base64 或有效 session_id"}), 400
+            encoded = image_base64.split(",", 1)[1] if "," in image_base64 else image_base64
+            image_bytes = base64.b64decode(encoded, validate=True)
+            source_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+            created = segmentation_service.create_session(np.asarray(source_image))
+            session_id = created["session_id"]
+            session = session_manager.get(session_id)
+
+        if session is None:
+            return jsonify({"success": False, "error": "Session 创建失败"}), 500
+
+        x = float(data["x"])
+        y = float(data["y"])
+        label = int(data.get("label", 1))
+        if label not in (0, 1):
+            return jsonify({"success": False, "error": "label 必须是 0 或 1"}), 400
+        if not (0 <= x < session.width and 0 <= y < session.height):
+            return jsonify({"success": False, "error": "提示点超出原始截图范围"}), 400
+
+        prediction = segmentation_service.predict_points(
+            session_id=session_id,
+            point_coords=np.asarray([[x, y]], dtype=np.float32),
+            point_labels=np.asarray([label], dtype=np.int32),
+            multimask_output=False,
+        )
+        mask = prediction["mask"]
+        if hasattr(mask, "detach"):
+            mask = mask.detach().cpu().numpy()
+        mask = np.squeeze(np.asarray(mask)).astype(np.uint8)
+
+        # SAM 输出对应增强图尺寸；前端边界仍使用原始截图像素坐标。
+        if mask.shape != (session.height, session.width):
+            mask = np.asarray(
+                Image.fromarray(mask * 255, mode="L").resize(
+                    (session.width, session.height),
+                    resample=Image.Resampling.NEAREST,
+                )
+            ) > 0
+        mask_uint8 = (mask.astype(np.uint8) * 255)
+        contours, _ = cv2.findContours(
+            mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        boundaries = []
+        for contour in contours:
+            if len(contour) < 3 or cv2.contourArea(contour) < 4:
+                continue
+            epsilon = max(1.0, 0.0015 * cv2.arcLength(contour, True))
+            simplified = cv2.approxPolyDP(contour, epsilon, True)
+            coords = simplified.reshape(-1, 2).astype(float).tolist()
+            if len(coords) >= 3:
+                coords.append(coords[0])
+                boundaries.append({
+                    "geojson": {
+                        "type": "Polygon",
+                        "coordinates": [coords],
+                    }
+                })
+
+        return jsonify({
+            "success": True,
+            "session_id": session_id,
+            "boundaries": boundaries,
+            "confidence": float(prediction.get("score", 0.0)),
+            "processing_time_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "width": session.width,
+            "height": session.height,
+            "sr_enabled": session.sr_enabled,
+            "sr_scale_x": session.sr_scale_x,
+            "sr_scale_y": session.sr_scale_y,
+        })
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception("兼容 Point 预测失败")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
 # ============================================================
 # 删除 Session
 # ============================================================
