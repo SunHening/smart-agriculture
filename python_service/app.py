@@ -5,10 +5,11 @@ from PIL import Image
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
-from config import CHECKPOINT_PATH, DEVICE, MODEL_TYPE
+from config import CHECKPOINT_PATH, DEVICE, MODEL_TYPE, SR_ENABLED, SR_METHOD, SR_SCALE
 from service.sam_runtime import SamRuntime
 from service.session_manager import SessionManager
 from service.segmentation_service import SegmentationService
+from service.sr_service import SRService
 
 
 app = Flask(__name__)
@@ -27,9 +28,16 @@ runtime = SamRuntime(
 
 session_manager = SessionManager()
 
+sr_service = SRService(
+    enabled=SR_ENABLED,
+    scale=SR_SCALE,
+    method=SR_METHOD,
+)
+
 segmentation_service = SegmentationService(
     runtime=runtime,
     session_manager=session_manager,
+    sr_service=sr_service,
 )
 
 
@@ -132,6 +140,12 @@ def get_session(session_id: str):
         "width": session.width,
         "height": session.height,
         "original_size": list(session.original_size),
+        "sam_width": session.sam_width,
+        "sam_height": session.sam_height,
+        "sr_enabled": session.sr_enabled,
+        "sr_method": session.sr_method,
+        "sr_scale_x": session.sr_scale_x,
+        "sr_scale_y": session.sr_scale_y,
         "created_at": session.created_at.isoformat(),
         "last_accessed_at": session.last_accessed_at.isoformat(),
     })
@@ -321,12 +335,22 @@ def predict_points(session_id: str):
         }), 500
 
     # --------------------------------------------------------
-    # 8. 转换成 0 / 255
+    # 8. 恢复到原始截图尺寸（最近邻，避免二值 mask 被插值模糊）
     # --------------------------------------------------------
 
-    mask_uint8 = (
-        mask.astype(np.uint8) * 255
-    )
+    if mask.shape != (session.height, session.width):
+        mask_image_for_resize = Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
+        mask_image_for_resize = mask_image_for_resize.resize(
+            (session.width, session.height),
+            resample=Image.Resampling.NEAREST,
+        )
+        mask = np.asarray(mask_image_for_resize) > 0
+
+    # --------------------------------------------------------
+    # 9. 转换成 0 / 255
+    # --------------------------------------------------------
+
+    mask_uint8 = mask.astype(np.uint8) * 255
 
     # --------------------------------------------------------
     # 9. 编码成 PNG
