@@ -13,7 +13,7 @@
       <div class="map-wrap">
         <div class="map-area">
           <div id="tdt-map" ref="mapRef"></div>
-          
+
           <div class="map-toolbar">
 
   <el-button-group size="small" style="margin-right:8px">
@@ -64,16 +64,6 @@
     Box
   </el-button>
 
-  <!-- Automatic -->
-  <el-button
-    type="warning"
-    size="small"
-    @click="automaticSegment"
-    :loading="automaticLoading"
-  >
-    {{ automaticLoading ? '分析中...' : 'Automatic' }}
-  </el-button>
-
   <!-- Clear -->
   <el-button
     type="info"
@@ -96,15 +86,49 @@
           <el-divider />
           <div class="panel-section">
             <div class="panel-label">检测结果</div>
-            <div v-if="!result" class="panel-value">
+            <div v-if="!result && !areaResult && !autoResult" class="panel-value">
               请选择 Point、Box 或 Automatic 开始分割
             </div>
+
             <template v-else>
               <div class="result-grid">
-                <div class="result-item"><span class="rl">面积</span><span class="rv primary">{{ result.area }} 亩</span></div>
-                <div class="result-item"><span class="rl">置信度</span><span class="rv success">{{ result.confidence }}%</span></div>
-                <div class="result-item"><span class="rl">地块数</span><span class="rv">{{ result.fieldCount }}</span></div>
-                <div class="result-item"><span class="rl">耗时</span><span class="rv">{{ result.time }}ms</span></div>
+
+                <!-- 面积 -->
+                <div class="result-item">
+                  <span class="rl">面积</span>
+                  <span class="rv primary">
+                    {{
+                      areaResult
+                        ? areaResult.areaMu.toFixed(2)
+                        : (autoResult?.area ?? result?.area ?? '--')
+                    }} 亩
+                  </span>
+                </div>
+
+                <!-- 置信度 -->
+                <div class="result-item">
+                  <span class="rl">置信度</span>
+                  <span class="rv success">
+                    {{ autoResult?.confidence ?? result?.confidence ?? '--' }}%
+                  </span>
+                </div>
+
+                <!-- 地块数 -->
+                <div class="result-item">
+                  <span class="rl">地块数</span>
+                  <span class="rv">
+                    {{ autoResult?.fieldCount ?? result?.fieldCount ?? '--' }}
+                  </span>
+                </div>
+
+                <!-- 耗时 -->
+                <div class="result-item">
+                  <span class="rl">耗时</span>
+                  <span class="rv">
+                    {{ autoResult?.time ?? result?.time ?? '--' }}ms
+                  </span>
+                </div>
+
               </div>
             </template>
           </div>
@@ -119,7 +143,6 @@ import { ref, onMounted, nextTick, onUnmounted } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import html2canvas from 'html2canvas'
-import { getFieldList, samGeoDetectImage } from '../../../api'
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 
@@ -132,9 +155,15 @@ const drawing = ref(false)
 const pointMode = ref(false)
 const promptPoints = ref([])
 
-const result = ref(null)
+// SAM Prompt结果(Point/Box)
+const samResult = ref(null)
+
 const fieldList = ref([])
 const fieldId = ref(null)
+const result = ref(null)
+
+// Box面积结果
+const areaResult = ref(null)
 
 // ============================================================
 // SAM Point Prompt 状态
@@ -147,6 +176,19 @@ const promptMode = ref(null)
 
 // Hover 预览是否正在计算
 const hoverLoading = ref(false)
+
+// ============================================================
+// SAM Session
+// ============================================================
+
+// 当前地图截图对应的 SAM Session
+const samSessionId = ref(null)
+
+// 当前 SAM 图片对应的地图范围
+let samImageBounds = null
+
+// 当前正式 SAM Mask 图层
+let samMaskLayer = null
 
 // Point 模式下固定使用的“干净地图截图”
 let promptImageBase64 = null
@@ -169,13 +211,16 @@ let currentLabel = null
 
 let promptPointMarkers = []
 
-let drawnLayer = null
+// Automatic农田边界图层
+let autoPolygonLayer = null
+
+
+// Box临时绘制图层
 let drawnItems = null
 let drawStartLatLng = null
 let tempRect = null
 let isDrawing = false
 let pointLayer = null
-let pointResultLayer = null
 
 const TK = 'b2d9cc5faa19adaf7b5c80c90e61e5d7'
 const SUBDOMAINS = ['0', '1', '2', '3', '4', '5', '6', '7']
@@ -255,33 +300,48 @@ const startPointPrompt = async (mode) => {
 
   if (!promptImageBase64) {
 
-    try {
+  try {
 
-      ElMessage.info(
-        '正在准备 SAM 图像，请稍候...'
-      )
+    ElMessage.info(
+      '正在准备 SAM 图像，请稍候...'
+    )
 
-      promptImageBase64 =
-        await capturePromptImage()
+    promptImageBase64 =
+      await capturePromptImage()
 
-      console.log(
-        'Point Prompt 图像准备完成'
-      )
+    // 记录这张截图对应的地图范围
+    samImageBounds = map.getBounds()
 
-    } catch (error) {
+    console.log(
+      'Point Prompt 图像准备完成'
+    )
 
-      console.error(
-        'Prompt 图像生成失败:',
-        error
-      )
+    ElMessage.info(
+      '正在创建 SAM Session，请稍候...'
+    )
 
-      ElMessage.error(
-        '无法获取地图图像'
-      )
+    await createSamSession()
 
-      return
-    }
+    console.log(
+      'SAM Session 创建完成:',
+      samSessionId.value
+    )
+
+  } catch (error) {
+
+    console.error(
+      'SAM Session 创建失败:',
+      error
+    )
+
+    ElMessage.error(
+      'SAM Session 创建失败：' +
+      (error.message || '未知错误')
+    )
+
+    return
   }
+}
 
   // ----------------------------------------------------
   // 5. 禁止地图拖动
@@ -301,7 +361,7 @@ const startPointPrompt = async (mode) => {
     // ----------------------------------------------------
 
     map.off('mousemove', onPointMouseMove)
-    map.on('mousemove', onPointMouseMove)
+    // map.on('mousemove', onPointMouseMove)
 
     console.log(
       'Hover mousemove 已注册'
@@ -315,24 +375,12 @@ const startPointPrompt = async (mode) => {
 }
 
 const predictHoverPoint = async (e) => {
-
-  if (!pointMode.value) {
-    return
-  }
-
-  if (!promptImageBase64) {
-    return
-  }
+  if (!pointMode.value) return
+  if (!promptImageBase64) return
+  if (!samSessionId.value) return
 
   const mapEl = document.getElementById('tdt-map')
-
-  if (!mapEl) {
-    return
-  }
-
-  // ----------------------------------------------------
-  // 1. 当前鼠标位置
-  // ----------------------------------------------------
+  if (!mapEl) return
 
   const mapWidth = mapEl.clientWidth
   const mapHeight = mapEl.clientHeight
@@ -340,182 +388,75 @@ const predictHoverPoint = async (e) => {
   const imageWidth = promptImageWidth.value
   const imageHeight = promptImageHeight.value
 
-  const containerPoint = e.containerPoint
-
-  // ----------------------------------------------------
-  // 2. Leaflet 坐标 → SAM 图片像素
-  // ----------------------------------------------------
-
   const x =
-    e.containerPoint.x *
-    imageWidth /
-    mapWidth
+    e.containerPoint.x * imageWidth / mapWidth
 
   const y =
-    e.containerPoint.y *
-    imageHeight /
-    mapHeight
-
-  console.log(
-    'Hover 坐标:',
-    'map =',
-    containerPoint.x,
-    containerPoint.y,
-    'image =',
-    x,
-    y
-  )
-  // ----------------------------------------------------
-  // 3. 防止鼠标跑到地图外
-  // ----------------------------------------------------
-
-  if (
-    x < 0 ||
-    y < 0 ||
-    x > imageWidth ||
-    y > imageHeight
-  ) {
-    return
-  }
-
-  // ----------------------------------------------------
-  // 4. 请求序号
-  //
-  // 非常重要：
-  //
-  // 鼠标可能快速移动：
-  //
-  // A 请求
-  // B 请求
-  // C 请求
-  //
-  // 如果 A 最后才返回，
-  // 不能让 A 覆盖 C 的结果。
-  // ----------------------------------------------------
+    e.containerPoint.y * imageHeight / mapHeight
 
   const requestId = ++hoverRequestId
 
   hoverLoading.value = true
 
   try {
-
     const response = await axios.post(
-      'http://127.0.0.1:5000/predict-point',
+      `/api/sam/session/${samSessionId.value}/prediction`,
       {
-        image_base64: promptImageBase64,
-        x,
-        y,
-        label: 1
+        points: [
+          {
+            x,
+            y,
+            label: 1
+          }
+        ],
+        multimask_output: true
       },
       {
+        responseType: 'blob',
         timeout: 120000
       }
     )
-
-    // ----------------------------------------------------
-    // 5. 如果这不是最新请求，直接丢弃
-    // ----------------------------------------------------
 
     if (requestId !== hoverRequestId) {
       return
     }
 
-    const data = response.data
+    const maskBlob = response.data
 
-    if (!data.success) {
-      return
+    if (!(maskBlob instanceof Blob)) {
+      throw new Error('SAM Hover 返回结果不是 Blob')
     }
-
-    // ----------------------------------------------------
-    // 6. 删除旧 Hover
-    // ----------------------------------------------------
 
     if (hoverLayer) {
       map.removeLayer(hoverLayer)
       hoverLayer = null
     }
 
-    hoverLayer = L.layerGroup().addTo(map)
+    const maskUrl = URL.createObjectURL(maskBlob)
 
-    // ----------------------------------------------------
-    // 7. SAM 边界 → Leaflet
-    // ----------------------------------------------------
-
-    if (data.boundaries) {
-
-      data.boundaries.forEach((boundary) => {
-
-        const coords =
-          boundary.geojson?.coordinates?.[0]
-
-        if (!coords || coords.length < 3) {
-          return
-        }
-
-        const latlngs = coords.map((coord) => {
-
-          const pixelX = coord[0]
-          const pixelY = coord[1]
-
-          const containerX =
-            pixelX *
-            mapWidth /
-            imageWidth
-
-          const containerY =
-            pixelY *
-            mapHeight /
-            imageHeight
-
-          return map.containerPointToLatLng(
-            L.point(
-              containerX,
-              containerY
-            )
-          )
-        })
-        
-
-        if (latlngs.length < 3) {
-          return
-        }
-
-        // ------------------------------------------------
-        // Hover 使用较淡的显示
-        // ------------------------------------------------
-
-        L.polygon(
-          latlngs,
-          {
-            color: '#409eff',
-            weight: 2,
-            fillColor: '#409eff',
-            fillOpacity: 0.18,
-            interactive: false
-          }
-        ).addTo(hoverLayer)
-      })
-    }
+    hoverLayer = L.imageOverlay(
+      maskUrl,
+      samImageBounds,
+      {
+        opacity: 0.25,
+        interactive: false
+      }
+    ).addTo(map)
 
   } catch (error) {
-
-    // Hover 本身不是关键操作
-    // 所以不要每次失败都弹 Element Message
-
-    console.debug(
-      'Hover prediction failed:',
-      error.message
-    )
-
+    if (requestId === hoverRequestId) {
+      console.debug(
+        'Hover prediction failed:',
+        error.message
+      )
+    }
   } finally {
-
     if (requestId === hoverRequestId) {
       hoverLoading.value = false
     }
   }
 }
 
-// ============================================================
 // Point Hover Preview
 // ============================================================
 
@@ -545,7 +486,7 @@ const onPointMouseMove = (e) => {
 }
 
 const onPointClick = async (e) => {
-  
+
   if (!pointMode.value) return
 
   console.log('========== POINT DEBUG ==========')
@@ -560,7 +501,7 @@ const onPointClick = async (e) => {
   console.log('DOM rect:', {
     width: mapEl?.getBoundingClientRect().width,
     height: mapEl?.getBoundingClientRect().height
-  })  
+  })
 
   console.log('Leaflet map:', {
     width: map.getSize().x,
@@ -688,116 +629,68 @@ const onPointClick = async (e) => {
         : '正在使用背景点排除区域...'
     )
 
+    if (!samSessionId.value) {
+      throw new Error('SAM Session 不存在')
+    }
+
     const response = await axios.post(
-      'http://127.0.0.1:5000/predict-point',
+      `/api/sam/session/${samSessionId.value}/prediction`,
       {
-        image_base64: promptImageBase64,
-        x,
-        y,
-        label
+        points: promptPoints.value,
+        multimask_output: true
       },
       {
+        responseType: 'blob',
         timeout: 120000
       }
     )
 
-    const data = response.data
+    const maskBlob = response.data
 
-    console.log('SAM Point result:', data)
-
-    if (!data.success) {
-      throw new Error(
-        data.error || 'Point 分割失败'
-      )
+    if (!(maskBlob instanceof Blob)) {
+      throw new Error('SAM 返回结果不是 Blob')
     }
 
-    // ----------------------------------------------------
-    // 7. 清除上一次 SAM 结果
-    // ----------------------------------------------------
+    console.log('SAM Mask:', {
+      type: maskBlob.type,
+      size: maskBlob.size
+    })
 
-    if (pointResultLayer) {
-      map.removeLayer(pointResultLayer)
-      pointResultLayer = null
+    const maskUrl = URL.createObjectURL(maskBlob)
+
+    if (samMaskLayer) {
+      map.removeLayer(samMaskLayer)
+      samMaskLayer = null
     }
 
-    pointResultLayer = L.layerGroup().addTo(map)
-
-    // ----------------------------------------------------
-    // 8. SAM 像素坐标 → Leaflet 坐标
-    // ----------------------------------------------------
-
-    if (data.boundaries) {
-
-      data.boundaries.forEach((boundary) => {
-
-        const coords =
-          boundary.geojson?.coordinates?.[0]
-
-        if (!coords || coords.length < 3) {
-          return
-        }
-
-        const latlngs = coords.map((coord) => {
-          const pixelX = coord[0]
-          const pixelY = coord[1]
-
-          const containerX =
-            pixelX *
-            mapWidth /
-            imageWidth
-
-          const containerY =
-            pixelY *
-            mapHeight /
-            imageHeight
-
-          return map.containerPointToLatLng(
-            L.point(
-              containerX,
-              containerY
-            )
-          )
-        })
-
-        L.polygon(
-          latlngs,
-          {
-            color: '#43a047',
-            weight: 2,
-            fillColor: '#43a047',
-            fillOpacity: 0.30,
-            interactive: false
-          }
-        )
-          .addTo(pointResultLayer)
-          .bindPopup(
-            `SAM Confidence: ${
-              (data.confidence * 100).toFixed(1)
-            }%`
-          )
-      })
-    }
+    samMaskLayer = L.imageOverlay(
+      maskUrl,
+      samImageBounds,
+      {
+        opacity: 0.45,
+        interactive: false
+      }
+    ).addTo(map)
 
     // ----------------------------------------------------
     // 9. 更新右侧结果
     // ----------------------------------------------------
 
+    const area = await calculateMaskArea(
+      maskBlob,
+      promptZoom.value
+    )
+
+    areaResult.value = area
+
     result.value = {
-      area: '-',
-      confidence: (
-        data.confidence * 100
-      ).toFixed(1),
-      fieldCount:
-        data.boundaries?.length || 0,
-      time:
-        data.processing_time_ms
+      area: area.areaMu,
+      confidence: '-',
+      fieldCount: 1,
+      time: '-'
     }
 
-    ElMessage.success(
-      `Point 分割完成，Confidence ${
-        (data.confidence * 100).toFixed(1)
-      }%`
-    )
+    ElMessage.success('Point 分割完成')
 
   } catch (error) {
 
@@ -817,7 +710,53 @@ const onPointClick = async (e) => {
   }
 }
 
+const startBoxPrompt = async () => {
+  if (!map) return
+
+  // 退出 Point 模式
+  pointMode.value = false
+  promptMode.value = 'box'
+
+  if (!promptImageBase64) {
+    promptImageBase64 = await capturePromptImage()
+    samImageBounds = map.getBounds()
+    await createSamSession()
+  }
+
+  hoverRequestId++
+
+  if (hoverTimer) {
+    clearTimeout(hoverTimer)
+    hoverTimer = null
+  }
+
+  if (hoverLayer) {
+    map.removeLayer(hoverLayer)
+    hoverLayer = null
+  }
+
+  map.off('click', onPointClick)
+  map.off('mousemove', onPointMouseMove)
+
+  if (pointLayer) {
+    map.removeLayer(pointLayer)
+    pointLayer = null
+  }
+
+  promptPoints.value = []
+
+  // 进入框选模式
+  drawing.value = true
+  map.dragging.disable()
+
+  map.off('mousedown', onDrawMouseDown)
+  map.on('mousedown', onDrawMouseDown)
+
+  ElMessage.info('请在地图上拖拽框选目标区域')
+}
+
 const onDrawMouseDown = (e) => {
+  console.log('[BOX] mousedown', e.latlng)
   drawStartLatLng = e.latlng
   isDrawing = true
   tempRect = L.rectangle([drawStartLatLng, drawStartLatLng], {
@@ -832,31 +771,112 @@ const onDrawMouseMove = (e) => {
   tempRect.setBounds(L.latLngBounds(drawStartLatLng, e.latlng))
 }
 
-const onDrawMouseUp = (e) => {
+const onDrawMouseUp = async (e) => {
+  console.log('[AREA] current zoom:', map.getZoom())
+  console.log('[BOX] mouseup', e.clientX, e.clientY)
+
   if (!isDrawing) return
+
   isDrawing = false
   map.off('mousemove', onDrawMouseMove)
   document.removeEventListener('mouseup', onDrawMouseUp)
 
-  // document 的 mouseup 是 DOM 事件（无 latlng），用容器坐标反算结束点
   const c = map.getContainer()
   const r = c.getBoundingClientRect()
+
   const endLatLng = map.containerPointToLatLng(L.point(e.clientX - r.left, e.clientY - r.top))
 
   if (tempRect) { map.removeLayer(tempRect); tempRect = null }
 
   const bounds = L.latLngBounds(drawStartLatLng, endLatLng)
-  const tiny = 0.00005
-  if (bounds.getNorth() - bounds.getSouth() < tiny || bounds.getEast() - bounds.getWest() < tiny) {
-    ElMessage.warning('框选区域过小，请重新拖拽一个更大的框')
-  } else {
-    drawnItems.clearLayers()
-    drawnLayer = L.rectangle(bounds, {
-      color: '#43a047', weight: 2, fillColor: '#43a047', fillOpacity: 0.15, interactive: false
-    })
-    drawnItems.addLayer(drawnLayer)
-    ElMessage.success('区域已选定，点击"检测农田"开始分析')
+
+  const startPoint = map.latLngToContainerPoint(drawStartLatLng)
+  const endPoint = map.latLngToContainerPoint(endLatLng)
+
+  const imageWidth = promptImageWidth.value
+  const imageHeight = promptImageHeight.value
+
+  const box = [
+    Math.max(0, Math.min(startPoint.x, endPoint.x)),
+    Math.max(0, Math.min(startPoint.y, endPoint.y)),
+    Math.min(imageWidth - 1, Math.max(startPoint.x, endPoint.x)),
+    Math.min(imageHeight - 1, Math.max(startPoint.y, endPoint.y))
+  ]
+  console.log('[BOX] SAM box:', box)
+
+  if (
+    box[2] - box[0] < 10 ||
+    box[3] - box[1] < 10
+  ) {
+    ElMessage.warning('框选区域太小')
+    return
   }
+
+  if (!samSessionId.value) {
+    throw new Error('SAM Session 不存在')
+  }
+
+  const response = await axios.post(
+    `/api/sam/session/${samSessionId.value}/box`,
+    {
+      box,
+      multimask_output: true
+    },
+    {
+      responseType: 'blob',
+      timeout: 120000
+    }
+  )
+
+  const maskBlob = response.data
+
+  console.log('[BOX] maskBlob:', maskBlob, maskBlob.type, maskBlob.size)
+
+  const samScore = response.headers['x-sam-score']
+
+  const confidence = samScore
+    ? Number(samScore) * 100
+    : null
+
+  console.log('[BOX] SAM confidence:', confidence)
+
+  result.value = {
+    ...(result.value || {}),
+    confidence
+  }
+
+  console.log('[AREA] start calculating')
+
+  const area = await calculateMaskArea(
+    maskBlob,
+    promptZoom.value
+  )
+
+  console.log('[BOX] area:', area)
+
+  areaResult.value = area
+
+  if (!(maskBlob instanceof Blob)) {
+    throw new Error('SAM Box 返回结果不是 Blob')
+  }
+
+  const maskUrl = URL.createObjectURL(maskBlob)
+
+  if (samMaskLayer) {
+    map.removeLayer(samMaskLayer)
+    samMaskLayer = null
+  }
+
+  samMaskLayer = L.imageOverlay(
+    maskUrl,
+    samImageBounds,
+    {
+      opacity: 0.45,
+      interactive: false
+    }
+  ).addTo(map)
+
+  ElMessage.success('Box 分割完成')
 
   map.off('mousedown', onDrawMouseDown)
   map.dragging.enable()
@@ -878,11 +898,6 @@ const clearDraw = () => {
     if (pointLayer) {
       map.removeLayer(pointLayer)
       pointLayer = null
-    }
-
-    if (pointResultLayer) {
-      map.removeLayer(pointResultLayer)
-      pointResultLayer = null
     }
 
     if (hoverLayer) {
@@ -914,10 +929,11 @@ const clearDraw = () => {
     drawnItems.clearLayers()
   }
 
-  drawnLayer = null
   result.value = null
+  autoResult.value = null
 }
 
+const promptZoom = ref(null)
 const promptImageWidth = ref(0)
 const promptImageHeight = ref(0)
 
@@ -946,6 +962,8 @@ const capturePromptImage = async () => {
   promptImageWidth.value = canvas.width
   promptImageHeight.value = canvas.height
 
+  promptZoom.value = map.getZoom()
+
   console.log('========== SAM Prompt Image ==========')
 
   console.log('Leaflet CSS:', {
@@ -963,51 +981,102 @@ const capturePromptImage = async () => {
   return canvas.toDataURL('image/png')
 }
 
-const detectField = async () => {
-  if (!drawnLayer) return
-  detecting.value = true
-  try {
-    const mapEl = document.getElementById('tdt-map')
-    const canvas = await html2canvas(mapEl, { useCORS: true, allowTaint: true, scale: 1 })
-    const imgBase64 = canvas.toDataURL('image/png')
-
-    const zoom = map.getZoom()
-    const gsdMap = { 13: 19.2, 14: 9.6, 15: 4.8, 16: 2.4, 17: 1.2, 18: 0.6, 19: 0.3 }
-    const gsd = gsdMap[zoom] || 1.2
-
-    const res = await samGeoDetectImage({ userId: user.id, fieldId: fieldId.value, imageBase64: imgBase64, gsd })
-    const data = res.data
-
-    // 在地图上绘制检测到的边界
-    if (drawnItems) drawnItems.clearLayers()
-    if (data.boundaries) {
-      const mapBounds = map.getBounds()
-      data.boundaries.forEach((b) => {
-        const coords = b.geojson.coordinates[0]
-        const latlngs = coords.map((c) => {
-          const lng = mapBounds.getWest() + (c[0] / canvas.width) * (mapBounds.getEast() - mapBounds.getWest())
-          const lat = mapBounds.getNorth() - (c[1] / canvas.height) * (mapBounds.getNorth() - mapBounds.getSouth())
-          return [lat, lng]
-        })
-        if (latlngs.length > 2) {
-          L.polygon(latlngs, { color: '#43a047', weight: 2, fillColor: '#43a047', fillOpacity: 0.25 })
-            .addTo(drawnItems).bindPopup(`${b.area_mu} 亩`)
-        }
-      })
-    }
-
-    result.value = {
-      area: data.totalAreaMu,
-      confidence: data.boundaries?.[0]?.confidence ? (data.boundaries[0].confidence * 100).toFixed(1) : '-',
-      fieldCount: data.fieldCount || data.boundaries?.length || 0,
-      time: data.processingTimeMs
-    }
-    ElMessage.success(`检测完成：${data.fieldCount || data.boundaries?.length || 0} 个地块，总面积 ${data.totalAreaMu} 亩`)
-  } catch (e) {
-    ElMessage.error('检测失败：' + (e.message || 'SAM-Geo 服务未启动'))
-  } finally {
-    detecting.value = false
+const createSamSession = async () => {
+  if (!promptImageBase64) {
+    throw new Error('SAM 图像不存在')
   }
+
+  // base64 → Blob
+  const response = await fetch(promptImageBase64)
+  const blob = await response.blob()
+
+  const formData = new FormData()
+  formData.append('image', blob, 'sam-image.png')
+
+  const res = await axios.post(
+    '/api/sam/session',
+    formData,
+    {
+      timeout: 120000
+    }
+  )
+
+  samSessionId.value = res.data.session_id
+
+  console.log('SAM Session 创建成功:', res.data)
+
+  return res.data
+}
+
+const calculateMaskArea = (maskBlob, zoom) => {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    const url = URL.createObjectURL(maskBlob)
+
+    image.onload = () => {
+      try {
+        const canvas = document.createElement('canvas')
+        canvas.width = image.width
+        canvas.height = image.height
+
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(image, 0, 0)
+
+        const imageData = ctx.getImageData(
+          0,
+          0,
+          image.width,
+          image.height
+        )
+
+        let foregroundPixels = 0
+
+        for (let i = 0; i < imageData.data.length; i += 4) {
+          const r = imageData.data[i]
+          const g = imageData.data[i + 1]
+          const b = imageData.data[i + 2]
+
+          if (r === 255 && g === 255 && b === 255) {
+            foregroundPixels++
+          }
+        }
+
+        const gsdMap = {
+          13: 19.2,
+          14: 9.6,
+          15: 4.8,
+          16: 2.4,
+          17: 1.2,
+          18: 0.6,
+          19: 0.3
+        }
+
+        const gsd = gsdMap[zoom] || 1.2
+
+        const areaM2 = foregroundPixels * gsd * gsd
+        const areaMu = areaM2 / 666.6667
+
+        URL.revokeObjectURL(url)
+
+        resolve({
+          foregroundPixels,
+          gsd,
+          areaM2,
+          areaMu
+        })
+      } catch (error) {
+        URL.revokeObjectURL(url)
+        reject(error)
+      }
+    }
+
+    image.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('无法读取 SAM Mask'))
+    }
+
+    image.src = url
+  })
 }
 
 onMounted(async () => {
@@ -1020,6 +1089,11 @@ onMounted(async () => {
     zoomControl: false,
     attributionControl: false
   })
+
+  drawnItems = L.layerGroup().addTo(map)
+
+  // Automatic检测结果
+  autoPolygonLayer = L.layerGroup().addTo(map)
   L.control.zoom({ position: 'bottomright' }).addTo(map)
   L.control.attribution({ position: 'bottomleft', prefix: '天地图' }).addTo(map)
   switchBasemap('img')

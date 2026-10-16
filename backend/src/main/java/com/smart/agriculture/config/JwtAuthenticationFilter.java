@@ -23,17 +23,23 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     private JwtUtils jwtUtils;
 
     @Override
-    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
-                                    FilterChain filterChain) throws ServletException, IOException {
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain)
+            throws ServletException, IOException {
+
         String token = getTokenFromRequest(request);
+
         if (StringUtils.hasText(token) && jwtUtils.validateToken(token)) {
             String username = jwtUtils.getUsernameFromToken(token);
             String role = jwtUtils.getRoleFromToken(token);
             SimpleGrantedAuthority authority = new SimpleGrantedAuthority("ROLE_" + role);
             UsernamePasswordAuthenticationToken authentication =
-                    new UsernamePasswordAuthenticationToken(username, null, Collections.singletonList(authority));
+                    new UsernamePasswordAuthenticationToken(
+                            username, null, Collections.singletonList(authority));
             SecurityContextHolder.getContext().setAuthentication(authentication);
         }
+
         filterChain.doFilter(request, response);
     }
 

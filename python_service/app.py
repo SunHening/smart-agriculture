@@ -372,6 +372,213 @@ def predict_points(session_id: str):
     return response
 
 
+
+# ============================================================
+# Box 提示预测
+# ============================================================
+
+@app.post("/sam/sessions/<session_id>/box")
+def predict_box(session_id: str):
+    """
+    根据 Session + Box 提示生成 raw mask。
+
+    请求 JSON：
+
+    {
+        "box": [x1, y1, x2, y2],
+        "multimask_output": false
+    }
+
+    Box 使用原始图像像素坐标：
+        x1, y1 = 左上角
+        x2, y2 = 右下角
+
+    返回：
+        image/png
+    """
+
+    # --------------------------------------------------------
+    # 1. 检查 Session
+    # --------------------------------------------------------
+
+    session = session_manager.get(session_id)
+
+    if session is None:
+        return jsonify({
+            "error": "Session 不存在"
+        }), 404
+
+    # --------------------------------------------------------
+    # 2. 读取 JSON
+    # --------------------------------------------------------
+
+    data = request.get_json(silent=True)
+
+    if data is None:
+        return jsonify({
+            "error": "请求必须是 JSON"
+        }), 400
+
+    box = data.get("box")
+
+    if not isinstance(box, list):
+        return jsonify({
+            "error": "box 必须是数组"
+        }), 400
+
+    if len(box) != 4:
+        return jsonify({
+            "error": "box 必须包含 [x1, y1, x2, y2]"
+        }), 400
+
+    try:
+        x1, y1, x2, y2 = map(float, box)
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": "box 坐标必须是数字"
+        }), 400
+
+    # --------------------------------------------------------
+    # 3. Box 范围检查
+    # --------------------------------------------------------
+
+    if x1 < 0 or x1 >= session.width:
+        return jsonify({
+            "error": f"x1 超出图片范围: {x1}"
+        }), 400
+
+    if x2 <= 0 or x2 > session.width:
+        return jsonify({
+            "error": f"x2 超出图片范围: {x2}"
+        }), 400
+
+    if y1 < 0 or y1 >= session.height:
+        return jsonify({
+            "error": f"y1 超出图片范围: {y1}"
+        }), 400
+
+    if y2 <= 0 or y2 > session.height:
+        return jsonify({
+            "error": f"y2 超出图片范围: {y2}"
+        }), 400
+
+    if x1 >= x2 or y1 >= y2:
+        return jsonify({
+            "error": "box 必须满足 x1 < x2 且 y1 < y2"
+        }), 400
+
+    box_array = np.asarray(
+        [x1, y1, x2, y2],
+        dtype=np.float32,
+    )
+
+    # --------------------------------------------------------
+    # 4. multimask_output
+    # --------------------------------------------------------
+
+    multimask_output = bool(
+        data.get("multimask_output", False)
+    )
+
+    # --------------------------------------------------------
+    # 5. 调用业务层
+    # --------------------------------------------------------
+
+    try:
+
+        result = segmentation_service.predict_box(
+            session_id=session_id,
+            box=box_array,
+            multimask_output=multimask_output,
+        )
+
+    except ValueError as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 400
+
+    except Exception as e:
+
+        app.logger.exception("SAM Box prediction 失败")
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+    # --------------------------------------------------------
+    # 6. 获取 raw mask
+    # --------------------------------------------------------
+
+    mask = result["mask"]
+
+    if hasattr(mask, "detach"):
+        mask = mask.detach().cpu().numpy()
+
+    mask = np.asarray(mask)
+
+    # --------------------------------------------------------
+    # 7. 去除多余维度
+    # --------------------------------------------------------
+
+    mask = np.squeeze(mask)
+
+    if mask.ndim != 2:
+        return jsonify({
+            "error": f"mask 维度错误: {mask.shape}"
+        }), 500
+
+    # --------------------------------------------------------
+    # 8. 转换成 0 / 255
+    # --------------------------------------------------------
+
+    mask_uint8 = (
+        mask.astype(np.uint8) * 255
+    )
+
+    # --------------------------------------------------------
+    # 9. 编码成 PNG
+    # --------------------------------------------------------
+
+    mask_image = Image.fromarray(
+        mask_uint8,
+        mode="L"
+    )
+
+    buffer = BytesIO()
+
+    mask_image.save(
+        buffer,
+        format="PNG"
+    )
+
+    buffer.seek(0)
+
+    # --------------------------------------------------------
+    # 10. 返回 mask
+    # --------------------------------------------------------
+
+    response = send_file(
+        buffer,
+        mimetype="image/png",
+        as_attachment=False,
+    )
+
+    response.headers["X-SAM-Score"] = str(
+        result.get("score", "")
+    )
+
+    response.headers["X-SAM-Width"] = str(
+        session.width
+    )
+
+    response.headers["X-SAM-Height"] = str(
+        session.height
+    )
+
+    return response
+
+
 # ============================================================
 # 删除 Session
 # ============================================================
